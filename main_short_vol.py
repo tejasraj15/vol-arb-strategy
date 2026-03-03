@@ -3,21 +3,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import warnings
-from preprocess_data import get_log_returns, parse_data
-from garch import garch_modelling
+from preprocess_data import parse_data
 from implied_vol_surface import ImpliedVolSurface
-from Delta_Hedging import DeltaHedger
+from dividend_yield import get_dividend_yield
 from transactionCosts import TransactionCost
 from regime_identifier import RegimeBlockerXGB
 from earnings_blocker import EarningsBlocker
-from scipy.stats import norm
+from volForecaster import VolForecaster
+from position import Position
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-DE_MEAN = "AR"
-MODEL = "EGARCH"
-DISTRIBUTION = {"GARCH": "normal", "EGARCH": "t"}[MODEL]
-validity_checks = False
 
 def load_options_data(filepath, ticker=None):
     df = pd.read_csv(filepath)
@@ -27,8 +22,8 @@ def load_options_data(filepath, ticker=None):
     if ticker:
         df = df[df['ticker'] == ticker].copy()
         if len(df) == 0:
-            print(f"  [!] Warning: No data found for ticker '{ticker}'")
-            print(f"  Available tickers: {sorted(df['ticker'].unique())[:10]}... ({len(df['ticker'].unique())} total)")
+            print(f"No data found for ticker '{ticker}'")
+            print(f"Available tickers: {sorted(df['ticker'].unique())[:10]}... ({len(df['ticker'].unique())} total)")
     
     # Use mid_price if available, otherwise calculate from bid/offer
     if 'mid_price' in df.columns:
@@ -48,8 +43,14 @@ def load_options_data(filepath, ticker=None):
     
     return df
 
-def get_iv_surface_for_date(options_df, date, spot_price, risk_free_rate=0.02, dividend_yield=0.02):
-    date_options = options_df[options_df['date'] == date].copy()
+def get_iv_surface_for_date(options_df, date, spot_price, risk_free_rate=0.02, dividend_yield=0.0, options_by_date=None):
+    if options_by_date is not None:
+        date_options = options_by_date.get(date)
+        if date_options is None:
+            return None, None, None
+        date_options = date_options.copy()
+    else:
+        date_options = options_df[options_df['date'] == date].copy()
     
     if len(date_options) == 0:
         return None, None, None
@@ -59,14 +60,14 @@ def get_iv_surface_for_date(options_df, date, spot_price, risk_free_rate=0.02, d
     if len(calls) < 10:  # Need minimum data
         return None, None, None
     
-    # Filter out only the most problematic options that cause numerical issues
-    # 1. Remove expired or very short-dated options (< 2 days) - these cause div/0
+    # Filter out problematic options that cause numerical issues
+    # Remove expired or very short-dated options (< 2 days)
     calls = calls[calls['days_to_expiry'] >= 2].copy()
     
-    # 2. Remove options with zero or negative prices (invalid data)
+    # Remove options with zero or negative prices (invalid)
     calls = calls[calls['market_price'] > 0.01].copy()
     
-    # 3. Remove extreme OTM options to avoid numerical instability (strike > 3x spot)
+    # Remove extreme OTM options (strike > 3x spot)
     calls = calls[calls['strike_price'] < spot_price * 3.0].copy()
     
     if len(calls) < 10:  # Recheck after filtering
@@ -97,8 +98,14 @@ def get_iv_surface_for_date(options_df, date, spot_price, risk_free_rate=0.02, d
     
     return strikes, maturities, market_prices
 
-def get_atm_option_for_dte(options_df, date, spot_price, target_dte=45, dte_range=(30, 45)):
-    date_options = options_df[options_df['date'] == date].copy()
+def get_atm_option_for_dte(options_df, date, spot_price, target_dte=45, dte_range=(30, 45), options_by_date=None):
+    if options_by_date is not None:
+        date_options = options_by_date.get(date)
+        if date_options is None:
+            return None
+        date_options = date_options.copy()
+    else:
+        date_options = options_df[options_df['date'] == date].copy()
     
     if len(date_options) == 0:
         return None
@@ -154,630 +161,83 @@ def get_iv_for_option(iv_calc, strike, maturity, call_price, put_price):
         return np.nan
 
 
-def rolling_window_backtest(ticker, train_window=126, refit_frequency=21, 
-                            starting_capital=100000, position_size=8000,
-                            start_date=None, end_date=None,
-                            use_regime_blocker=True,
-                            use_earnings_blocker=True,
-                            earnings_csv='earnings_data.csv',
-                            earnings_before=7, 
-                            earnings_after=2, 
-                            earnings_exit=3,
-                            verbose=False):
-    
-    print("="*80)
-    print("SHORT VOL STRATEGY - 45 DTE STRADDLE BACKTEST")
-    print("="*80)
-    print("\n  Strategy Rules:")
-    print("    Entry: Market IV > GARCH + 2%, IV > 75th pctl, 30-45 DTE, no stress")
-    print("    Position: SELL ATM straddle, $8k size, delta hedge daily")
-    print("    Exit Day 7: IV -3% take profit, IV +2% stop loss")
-    print("    Exit Day 10: IV -2% take profit, IV +3% stop loss")
-    print("    Exit Day 14: Mandatory exit OR 2x premium stop loss")
-    
-    ticker_upper = ticker.upper()
-    ticker_upper = ticker.upper()
-    ticker_lower = ticker.lower()
-    sp_data_path = f"{ticker_lower}_stock_prices_2020_2024.csv"
-    options_data_path = f"{ticker_lower}_options_2020_2024.csv"
-    
-    print(f"\n[1/6] Loading data for {ticker_upper}...")
-    
-    stock_data = pd.read_csv(sp_data_path, parse_dates=['date'])
-    stock_data['date'] = pd.to_datetime(stock_data['date'])
-    stock_data = stock_data.set_index('date').sort_index()
-    
-    print(f"  [i] Using {ticker_upper} stock and options data")
-    options_data = load_options_data(options_data_path, ticker=ticker_upper)
-    print(f"  * Loaded {len(stock_data)} days of {ticker_upper} stock data")
-    print(f"  * Loaded {len(options_data)} option quotes for {ticker_upper}")
-    
-    trading_dates = sorted(options_data['date'].unique())
-    trading_dates_set = set(trading_dates)
-    
-    if start_date is not None:
-        start_date = pd.to_datetime(start_date)
-        trading_dates = [d for d in trading_dates if d >= start_date]
-        print(f"  [i] Start date filter: {start_date.date()}")
-    
-    if end_date is not None:
-        end_date = pd.to_datetime(end_date)
-        trading_dates = [d for d in trading_dates if d <= end_date]
-        print(f"  [i] End date filter: {end_date.date()}")
-    
-    print(f"  * {len(trading_dates)} trading dates with options data")
-    print(f"  [i] Training window: {train_window} days, will start backtesting from day {train_window + 1}")
-    
-    if len(trading_dates) <= train_window:
-        print(f"  [!] Error: Not enough data! Need >{train_window} days, have {len(trading_dates)}")
-        return None
-    
-    print(f"\n[2/6] Computing historical IV percentiles...")
-    
-    if use_earnings_blocker:
-        print(f"\n[2.5/6] Initializing earnings blocker...")
-        earnings_blocker = EarningsBlocker(
-            ticker=ticker,
-            earnings_csv=earnings_csv,
-            before_days=earnings_before,
-            after_days=earnings_after,
-            exit_days=earnings_exit,
-            verbose=verbose
-        )
+def should_enter(market_iv, garch_forecast, iv_history, regime_blocker, earnings_blocker, current_date):
+    """
+    Evaluate whether market conditions justify entering a short vol trade.
+    Returns (signal, iv_diff, iv_percentile, is_blocked, entry_notes).
+    """
+    iv_diff = market_iv - garch_forecast
+    garch_signal = iv_diff > 0.03
+
+    if len(iv_history) >= 20:
+        iv_percentile = (np.array(iv_history) < market_iv).sum() / len(iv_history) * 100
+        iv_expensive = iv_percentile > 80
     else:
-        print(f"\n[2.5/6] Earnings blocker disabled")
-        earnings_blocker = None
-    
-    regime_blocker = None
-    if use_regime_blocker:
-        print(f"\n[3/6] Initializing regime blocker...")
-        backtest_start_date = trading_dates[train_window]
-        historical_stock_data = stock_data.loc[:backtest_start_date].iloc[:-1]
-        log_returns_historical = parse_data(historical_stock_data.reset_index(), price_col='prc')
-        
-        print(f"  [i] Training regime blocker on data up to {backtest_start_date.date()} ({len(log_returns_historical)} days)")
-        print(f"  [i] This ensures no look-ahead bias - blocker never sees backtest period data")
-        
+        iv_expensive = True
+        iv_percentile = 50
+
+    is_blocked = False
+    if regime_blocker is not None:
         try:
-            regime_blocker = RegimeBlockerXGB(
-                returns=log_returns_historical,
-                stress_vol_percentile=90.0,
-                stress_drawdown_threshold=-0.05,
-                calm_vol_percentile=25.0,
-                block_threshold=0.5,
-                random_state=42,
-                verbose=False
-            )
-            print("  * Regime blocker initialized successfully (trained on pre-backtest data only)")
-        except Exception as e:
-            print(f"  [!] Warning: Could not initialize regime blocker: {e}")
-            print("  * Continuing without regime blocking")
-            regime_blocker = None
-    else:
-        print(f"\n[3/6] Regime blocker disabled (use_regime_blocker=False)")
-    
-    results = []
-    trade_log = []
-    portfolio_value = starting_capital
-    cash = starting_capital
-    active_position = None
-    tc_calc = TransactionCost()
-    iv_history = []
-    
-    print("\n[4/6] Starting rolling window backtest...")
-    print(f"  Starting Capital: ${starting_capital:,.2f}")
-    print(f"  Position Size: ${position_size:,.2f}")
-    last_garch_fit_date = None
-    garch_forecast = None
-    
-    processed_count = 0
-    skipped_count = 0
-    blocked_count = 0
-    trades_entered = 0
-    trades_exited = 0
-    total_dates = len(trading_dates)
-    total_hedge_costs = 0
-    total_hedge_pnl = 0
-    
-    forecast_history = []
-    market_iv_history = []
-    
-    def calculate_vol_risk_premium(forecast_hist, market_hist, min_samples=60):
-        if len(forecast_hist) < min_samples:
-            # Not enough data: use default equity risk premium
-            return 0.03  # 3% is typical for equities
-        
-        # Use last 60-126 observations for rolling calibration
-        lookback = min(126, len(forecast_hist))
-        recent_forecasts = np.array(forecast_hist[-lookback:])
-        recent_markets = np.array(market_hist[-lookback:])
-        
-        # Calculate median difference (robust to outliers)
-        risk_premium = np.median(recent_markets - recent_forecasts)
-        
-        # Sanity check: risk premium should be 0-10%
-        risk_premium = np.clip(risk_premium, 0.0, 0.10)
-        
-        return risk_premium
-    
-    def ensemble_vol_forecast(returns, base_forecast):
-        forecasts = [base_forecast]
-        
-        if len(returns) >= 21:
-            recent_rv = returns.tail(21).std() * np.sqrt(252)
-            forecasts.append(recent_rv)
-        
-        if len(returns) >= 30:
-            ewma_vol = returns.ewm(span=30).std().iloc[-1] * np.sqrt(252)
-            forecasts.append(ewma_vol)
-        
-        return np.median(forecasts)
-    
-    for i, current_date in enumerate(trading_dates):
-        # progress indicator
-        if i % 20 == 0:
-            progress_pct = (i / total_dates) * 100
-            print(f"\r  Progress: {i}/{total_dates} dates ({progress_pct:.1f}%) - Trades: {trades_entered} entered, {trades_exited} exited, Blocked: {blocked_count}", end="", flush=True)
-        
-        if i < train_window:
-            continue  # Need minimum training data
-        
-        if current_date not in stock_data.index:
-            skipped_count += 1
-            if verbose:
-                print(f"  [{current_date.date()}] No stock data for this date")
-            continue
-        spot_price = stock_data.loc[current_date, 'prc']
-        
-        # Refit GARCH model periodically
-        days_since_fit = (current_date - last_garch_fit_date).days if last_garch_fit_date else refit_frequency + 1
-        
-        if days_since_fit >= refit_frequency or garch_forecast is None:
-            if verbose:
-                print(f"\n  [{current_date.date()}] Refitting GARCH model (window: {train_window} days)...")
-            
-            # Get historical returns for training
-            historical_data = stock_data.loc[:current_date].iloc[-train_window-1:-1]
-            log_returns = parse_data(historical_data, price_col='prc')
-            
-            try:
-                _, sigma_forecast_base = garch_modelling(log_returns, DE_MEAN, MODEL, DISTRIBUTION, validity_checks=False)
-                sigma_forecast_ensemble = ensemble_vol_forecast(log_returns, sigma_forecast_base)
-                vol_risk_premium = calculate_vol_risk_premium(forecast_history, market_iv_history)
-                garch_forecast = sigma_forecast_ensemble + vol_risk_premium
-                
-                last_garch_fit_date = current_date
-                
-                if verbose:
-                    print(f"\n  [{current_date.date()}] Refit Model:")
-                    print(f"    Base EGARCH:     {sigma_forecast_base:.2%}")
-                    print(f"    Ensemble:        {sigma_forecast_ensemble:.2%}")
-                    print(f"    Risk Premium:    {vol_risk_premium:.2%}")
-                    print(f"    Final Forecast:  {garch_forecast:.2%}")
-                
-            except Exception as e:
-                if verbose:
-                    print(f"\n  [{current_date.date()}] GARCH fit failed: {e}, skipping...")
-                continue
-        
-        if active_position is not None:
-            days_held = (current_date - active_position['entry_date']).days
-            
-            current_option = get_atm_option_for_dte(
-                options_data, current_date, spot_price,
-                target_dte=active_position['dte_remaining'],
-                dte_range=(max(1, active_position['dte_remaining'] - 5), active_position['dte_remaining'] + 5)
-            )
-            
-            date_options = options_data[options_data['date'] == current_date]
-            strike_options = date_options[date_options['strike_price'] == active_position['strike']]
-            
-            current_iv = None
-            current_straddle_value = None
-            
-            if len(strike_options) > 0:
-                # Find options with similar expiry
-                calls = strike_options[strike_options['cp_flag'] == 'C']
-                puts = strike_options[strike_options['cp_flag'] == 'P']
-                
-                if len(calls) > 0 and len(puts) > 0:
-                    # Get option closest to original expiry
-                    calls = calls.iloc[(calls['exdate'] - active_position['exdate']).abs().argsort()[:1]]
-                    puts = puts.iloc[(puts['exdate'] - active_position['exdate']).abs().argsort()[:1]]
-                    
-                    if len(calls) > 0 and len(puts) > 0:
-                        current_call_price = calls['market_price'].iloc[0]
-                        current_put_price = puts['market_price'].iloc[0]
-                        current_straddle_value = (current_call_price + current_put_price) * 100 * active_position['num_straddles']
-                        
-                        # Calculate current IV
-                        current_dte = max(1, active_position['entry_dte'] - days_held)
-                        current_maturity = current_dte / 365
-                        
-                        iv_calc = ImpliedVolSurface(
-                            spot_price=spot_price,
-                            risk_free_rate=0.02,
-                            dividend_yield=0.02,
-                            verbose=False
-                        )
-                        current_iv = get_iv_for_option(iv_calc, active_position['strike'], current_maturity, 
-                                                       current_call_price, current_put_price)
-            
-            # If we couldn't get current values, estimate them
-            if current_straddle_value is None or current_iv is None:
-                # Skip this day for position management
-                active_position['dte_remaining'] = max(1, active_position['entry_dte'] - days_held)
-                continue
-            
-            # Track IV change
-            iv_change = current_iv - active_position['entry_iv']
-            iv_change_pct = iv_change * 100  # Convert to percentage points
-            
-            # Daily delta hedging with proper P&L calculation
-            hedger = DeltaHedger(spot_price, risk_free_rate=0.02, dividend_yield=0.02)
-            current_maturity = max(0.01, (active_position['entry_dte'] - days_held) / 365)
-            
-            hedge_result = hedger.calculate_hedge_position(
-                spot_price, active_position['strike'], current_maturity, current_iv
-            )
-            
-            d1 = (np.log(spot_price / active_position['strike']) + 
-                  (0.02 - 0.02 + 0.5 * current_iv**2) * current_maturity) / \
-                 (current_iv * np.sqrt(current_maturity))
-            
-            # Straddle delta = call delta + put delta
-            call_delta = np.exp(-0.02 * current_maturity) * norm.cdf(d1)
-            put_delta = -np.exp(-0.02 * current_maturity) * norm.cdf(-d1)
-            straddle_delta = call_delta + put_delta
-            
-            # Straddle gamma = 2 * single option gamma (call and put have same gamma)
-            single_gamma = np.exp(-0.02 * current_maturity) * norm.pdf(d1) / \
-                           (spot_price * current_iv * np.sqrt(current_maturity))
-            straddle_gamma = 2 * single_gamma
-            
-            prev_spot = active_position.get('prev_spot', active_position['entry_spot'])
-            spot_change = spot_price - prev_spot
-            prev_delta = active_position.get('prev_delta', 0)
-            prev_gamma = active_position.get('prev_gamma', straddle_gamma)
-            
-            delta_hedge_pnl = -prev_delta * spot_change * active_position['num_straddles']
-            gamma_pnl = -0.5 * prev_gamma * (spot_change ** 2) * active_position['num_straddles']
-            theta_pnl = -hedger.calculate_theta_pnl(active_position['strike'], current_maturity, 
-                                                   current_iv, days=1) * active_position['num_straddles'] * 100
-            
-            if 'prev_hedge_units' in active_position:
-                hedge_adjustment = abs(hedge_result['hedge_units'] - active_position['prev_hedge_units'])
-                hedge_rebalance_cost = hedge_adjustment * spot_price * 0.001
-            else:
-                hedge_rebalance_cost = 0
-            
-            daily_hedge_pnl = delta_hedge_pnl + gamma_pnl + theta_pnl - hedge_rebalance_cost
-            active_position['cumulative_hedge_pnl'] = active_position.get('cumulative_hedge_pnl', 0) + daily_hedge_pnl
-            active_position['cumulative_gamma_pnl'] = active_position.get('cumulative_gamma_pnl', 0) + gamma_pnl
-            active_position['cumulative_theta_pnl'] = active_position.get('cumulative_theta_pnl', 0) + theta_pnl
-            active_position['cumulative_delta_pnl'] = active_position.get('cumulative_delta_pnl', 0) + delta_hedge_pnl
-            active_position['total_hedge_cost'] = active_position.get('total_hedge_cost', 0) + hedge_rebalance_cost
-            total_hedge_costs += hedge_rebalance_cost
-            
-            # Update position tracking for next day
-            active_position['prev_hedge_units'] = hedge_result['hedge_units']
-            active_position['prev_spot'] = spot_price
-            active_position['prev_delta'] = straddle_delta
-            active_position['prev_gamma'] = straddle_gamma
-            
-            should_exit = False
-            exit_reason = None
-            option_pnl = active_position['entry_credit'] - current_straddle_value
-            
-            # Check for forced exit due to earnings
-            if earnings_blocker and earnings_blocker.should_force_exit(current_date):
-                should_exit = True
-                exit_reason = earnings_blocker.get_block_reason()
-            # Position-based stop loss (lose 2x premium collected)
-            elif option_pnl < -2 * active_position['entry_credit']:
-                should_exit = True
-                exit_reason = f"Position stop loss (2x premium): P&L ${option_pnl:.0f}"
-            elif days_held >= 14:
-                # Day 14: EXIT regardless
-                should_exit = True
-                exit_reason = "Day 14 mandatory exit"
-            elif days_held >= 10:
-                # Day 10-13: REVERSED - profit when IV drops, stop when IV spikes
-                if iv_change_pct <= -2.0:
-                    should_exit = True
-                    exit_reason = f"Day {days_held} take profit (IV {iv_change_pct:.1f}%)"
-                elif iv_change_pct >= 3.0:
-                    should_exit = True
-                    exit_reason = f"Day {days_held} stop loss (IV +{iv_change_pct:.1f}%)"
-            elif days_held >= 7:
-                # Day 7-9: REVERSED - profit when IV drops significantly
-                if iv_change_pct <= -3.0:
-                    should_exit = True
-                    exit_reason = f"Day {days_held} take profit (IV {iv_change_pct:.1f}%)"
-                elif iv_change_pct >= 2.0:
-                    should_exit = True
-                    exit_reason = f"Day {days_held} stop loss (IV +{iv_change_pct:.1f}%)"
-            
-            if should_exit:
-                cumulative_hedge_pnl = active_position.get('cumulative_hedge_pnl', 0)
-                exit_cost = tc_calc.calculate(
-                    price=current_straddle_value / (100 * active_position['num_straddles']),
-                    contracts=active_position['num_straddles'] * 2,
-                    ticker=ticker_upper
-                )
-                
-                entry_cost_tc = active_position.get('entry_tc', 0)
-                total_hedge_rebalance_costs = active_position.get('total_hedge_cost', 0)
-                gross_pnl = option_pnl + cumulative_hedge_pnl
-                net_pnl = gross_pnl - entry_cost_tc - exit_cost
-                
-                portfolio_value += net_pnl
-                trades_exited += 1
-                
-                trade_log.append({
-                    'entry_date': active_position['entry_date'],
-                    'exit_date': current_date,
-                    'days_held': days_held,
-                    'strike': active_position['strike'],
-                    'entry_iv': active_position['entry_iv'],
-                    'exit_iv': current_iv,
-                    'iv_change': iv_change,
-                    'iv_change_pct': iv_change_pct,
-                    'entry_credit': active_position['entry_credit'],
-                    'exit_cost': current_straddle_value,
-                    'option_pnl': option_pnl,
-                    'gamma_pnl': active_position.get('cumulative_gamma_pnl', 0),
-                    'theta_pnl': active_position.get('cumulative_theta_pnl', 0),
-                    'delta_hedge_pnl': active_position.get('cumulative_delta_pnl', 0),
-                    'hedge_pnl': cumulative_hedge_pnl,
-                    'gross_pnl': gross_pnl,
-                    'entry_tc': entry_cost_tc,
-                    'exit_tc': exit_cost,
-                    'hedge_rebalance_costs': total_hedge_rebalance_costs,
-                    'net_pnl': net_pnl,
-                    'exit_reason': exit_reason,
-                    'garch_forecast': active_position['garch_forecast'],
-                    'num_straddles': active_position['num_straddles']
-                })
-                
-                if verbose:
-                    print(f"\n  [{current_date.date()}] EXIT: {exit_reason} | P&L: ${net_pnl:.2f}")
-                
-                active_position = None
-            else:
-                active_position['dte_remaining'] = max(1, active_position['entry_dte'] - days_held)
-                active_position['current_iv'] = current_iv
-                active_position['current_value'] = current_straddle_value
-            
-            results.append({
-                'date': current_date,
-                'spot_price': spot_price,
-                'forecast_iv': garch_forecast,
-                'market_iv': current_iv if current_iv else np.nan,
-                'position_status': 'HOLDING' if active_position else 'EXITED',
-                'days_held': days_held,
-                'iv_change_pct': iv_change_pct,
-                'portfolio_value': portfolio_value,
-                'trade_pnl_dollars': net_pnl if should_exit else 0,
-                'traded': should_exit
-            })
-            processed_count += 1
-            continue
-        
-        strikes, maturities, market_prices = get_iv_surface_for_date(
-            options_data, current_date, spot_price
-        )
-        
-        if strikes is None:
-            skipped_count += 1
-            if verbose:
-                print(f"  [{current_date.date()}] Insufficient options data, skipping...")
-            continue
-        
-        try:
-            iv_calc = ImpliedVolSurface(
-                spot_price=spot_price,
-                risk_free_rate=0.02,
-                dividend_yield=0.02,
-                strikes=strikes,
-                maturities=maturities,
-                market_prices=market_prices,
-                verbose=False
-            )
-            
-            if iv_calc.iv_surface is None:
-                skipped_count += 1
-                continue
-            
-            atm_option = get_atm_option_for_dte(
-                options_data, current_date, spot_price,
-                target_dte=45, dte_range=(30, 45)
-            )
-            
-            if atm_option is None:
-                skipped_count += 1
-                if verbose:
-                    print(f"  [{current_date.date()}] No 30-45 DTE options available")
-                continue
-            
-            market_iv = get_iv_for_option(
-                iv_calc, atm_option['strike'], atm_option['maturity'],
-                atm_option['call_price'], atm_option['put_price']
-            )
-            
-            if np.isnan(market_iv):
-                skipped_count += 1
-                continue
-            
-            iv_history.append(market_iv)
-            if len(iv_history) > 252:
-                iv_history = iv_history[-252:]
-            
-            if garch_forecast is not None:
-                forecast_history.append(garch_forecast)
-                market_iv_history.append(market_iv)
-                if len(forecast_history) > 252:
-                    forecast_history = forecast_history[-252:]
-                    market_iv_history = market_iv_history[-252:]
-            
-            iv_diff = market_iv - garch_forecast
-            garch_signal = iv_diff > 0.02
-            if len(iv_history) >= 20:  # Need some history
-                iv_percentile = (np.array(iv_history) < market_iv).sum() / len(iv_history) * 100
-                iv_expensive = iv_percentile > 75  # Top 25% - expensive
-            else:
-                iv_expensive = True  # Not enough history, assume expensive
-                iv_percentile = 50
-            
-            # 3. 30-45 DTE options available (already checked above)
-            dte_available = True
-            
-            # 4. No stress regime
+            is_blocked = regime_blocker.isBlocked(current_date.strftime('%Y-%m-%d'))
+        except Exception:
             is_blocked = False
-            if regime_blocker is not None:
-                try:
-                    is_blocked = regime_blocker.isBlocked(current_date.strftime('%Y-%m-%d'))
-                except:
-                    is_blocked = False
-            
-            if garch_signal and iv_expensive and dte_available and not is_blocked:
-                signal = 'SELL'
-            else:
-                signal = 'HOLD'
-                if is_blocked:
-                    blocked_count += 1
-            
-            entry_notes = []
-            if not garch_signal:
-                entry_notes.append(f"Market IV not expensive (diff {iv_diff:.1%} < 2%)")
-            if not iv_expensive:
-                entry_notes.append(f"IV percentile {iv_percentile:.0f} < 75")
-            if is_blocked:
-                entry_notes.append("Stress regime")
-            
-            if signal == 'SELL':
-                # Check earnings blocker
-                if earnings_blocker and earnings_blocker.should_block_entry(current_date):
-                    signal = 'HOLD'
-                    entry_notes.append(earnings_blocker.get_block_reason())
-                    continue
-                straddle_price_per_unit = atm_option['straddle_price'] * 100
-                num_straddles = max(1, int(position_size / straddle_price_per_unit))
-                entry_credit = straddle_price_per_unit * num_straddles
-                max_notional_risk = starting_capital * 0.15
-                if entry_credit > max_notional_risk:
-                    if verbose:
-                        print(f"\n  [{current_date.date()}] SKIPPED: Position too large (${entry_credit:.0f} > ${max_notional_risk:.0f})")
-                    signal = 'HOLD'  # Override signal
-                    continue
-                
-                # Entry transaction costs
-                entry_tc = tc_calc.calculate(
-                    price=atm_option['straddle_price'],
-                    contracts=num_straddles * 2,
-                    ticker=ticker_upper
-                )
-                
-                hedger = DeltaHedger(spot_price, risk_free_rate=0.02, dividend_yield=0.02)
-                hedge_result = hedger.calculate_hedge_position(
-                    spot_price, atm_option['strike'], atm_option['maturity'], market_iv
-                )
-                
-                straddle_delta = hedger.calculate_straddle_delta(
-                    spot_price, atm_option['strike'], atm_option['maturity'], 
-                    0.02, market_iv, 0.02
-                )
-                d1 = (np.log(spot_price / atm_option['strike']) + 
-                      (0.02 - 0.02 + 0.5 * market_iv**2) * atm_option['maturity']) / \
-                     (market_iv * np.sqrt(atm_option['maturity']))
-                straddle_gamma = np.exp(-0.02 * atm_option['maturity']) * norm.pdf(d1) / \
-                                 (spot_price * market_iv * np.sqrt(atm_option['maturity'])) * 2
-                active_position = {
-                    'entry_date': current_date,
-                    'strike': atm_option['strike'],
-                    'entry_dte': atm_option['dte'],
-                    'dte_remaining': atm_option['dte'],
-                    'exdate': atm_option['exdate'],
-                    'entry_iv': market_iv,
-                    'garch_forecast': garch_forecast,
-                    'entry_credit': entry_credit,
-                    'entry_tc': entry_tc,
-                    'num_straddles': num_straddles,
-                    'entry_spot': spot_price,
-                    'prev_spot': spot_price,
-                    'prev_hedge_units': hedge_result['hedge_units'],
-                    'prev_delta': straddle_delta,
-                    'prev_gamma': straddle_gamma,
-                    'cumulative_hedge_pnl': 0,
-                    'cumulative_gamma_pnl': 0,
-                    'cumulative_theta_pnl': 0,
-                    'cumulative_delta_pnl': 0,
-                    'total_hedge_cost': 0,
-                    'is_short': True
-                }
-                
-                trades_entered += 1
-                
-                if verbose:
-                    print(f"\n  [{current_date.date()}] ENTRY (SELL): Strike ${atm_option['strike']:.0f}, "
-                          f"DTE {atm_option['dte']}, IV {market_iv:.1%}, GARCH {garch_forecast:.1%}, "
-                          f"Credit ${entry_credit:.0f}")
-            
-            results.append({
-                'date': current_date,
-                'spot_price': spot_price,
-                'forecast_iv': garch_forecast,
-                'market_iv': market_iv,
-                'iv_spread': iv_diff,
-                'iv_percentile': iv_percentile if len(iv_history) >= 20 else np.nan,
-                'signal': signal,
-                'blocked': is_blocked,
-                'entry_notes': '; '.join(entry_notes) if entry_notes else '',
-                'atm_strike': atm_option['strike'],
-                'atm_dte': atm_option['dte'],
-                'straddle_price': atm_option['straddle_price'],
-                'portfolio_value': portfolio_value,
-                'trade_pnl_dollars': 0,
-                'traded': signal == 'SELL'
-            })
-            processed_count += 1
-            
-        except Exception as e:
-            skipped_count += 1
-            if verbose:
-                print(f"  [{current_date.date()}] Error: {str(e)}")
-            continue
-    
-    print(f"\n\n[5/6] Processing results...")
-    print(f"  Processed: {processed_count}, Skipped: {skipped_count}, Blocked: {blocked_count}")
-    print(f"  Trades entered: {trades_entered}, Trades exited: {trades_exited}")
-    
-    if len(forecast_history) > 0 and len(market_iv_history) > 0:
+
+    entry_notes = []
+    if not garch_signal:
+        entry_notes.append(f"Market IV not expensive (diff {iv_diff:.1%} < 3%)")
+    if not iv_expensive:
+        entry_notes.append(f"IV percentile {iv_percentile:.0f} < 80")
+    if is_blocked:
+        entry_notes.append("Stress regime")
+    if earnings_blocker and earnings_blocker.should_block_entry(current_date):
+        entry_notes.append(earnings_blocker.get_block_reason())
+        return 'HOLD', iv_diff, iv_percentile, is_blocked, entry_notes
+
+    signal = 'SELL' if (garch_signal and iv_expensive and not is_blocked) else 'HOLD'
+    return signal, iv_diff, iv_percentile, is_blocked, entry_notes
+
+
+def build_result_row(current_date, spot_price, garch_forecast, portfolio_value,
+                      market_iv=np.nan, iv_spread=np.nan, iv_percentile=np.nan,
+                      signal='HOLD', blocked=False, entry_notes='',
+                      atm_strike=np.nan, atm_dte=np.nan, straddle_price=np.nan,
+                      position_status='NONE', days_held=0, iv_change_pct=np.nan,
+                      trade_pnl_dollars=0.0, traded=False):
+    """Single schema for all result rows — prevents key mismatches between branches."""
+    return {
+        'date': current_date,
+        'spot_price': spot_price,
+        'forecast_iv': garch_forecast,
+        'market_iv': market_iv,
+        'iv_spread': iv_spread,
+        'iv_percentile': iv_percentile,
+        'signal': signal,
+        'blocked': blocked,
+        'entry_notes': entry_notes,
+        'atm_strike': atm_strike,
+        'atm_dte': atm_dte,
+        'straddle_price': straddle_price,
+        'position_status': position_status,
+        'days_held': days_held,
+        'iv_change_pct': iv_change_pct,
+        'portfolio_value': portfolio_value,
+        'trade_pnl_dollars': trade_pnl_dollars,
+        'traded': traded,
+    }
+
+def output_diagnostics(volForecaster: VolForecaster):
+    diagnostics = volForecaster.get_forecast_diagnostics()
+    if diagnostics:
         print(f"\n  Forecast Quality Analysis:")
-        forecast_arr = np.array(forecast_history)
-        market_arr = np.array(market_iv_history)
-        
-        forecast_error = forecast_arr - market_arr
-        print(f"    Mean Forecast:          {forecast_arr.mean():.2%}")
-        print(f"    Mean Market IV:         {market_arr.mean():.2%}")
-        print(f"    Mean Forecast Error:    {forecast_error.mean():.2%}")
-        print(f"    RMSE:                   {np.sqrt((forecast_error**2).mean()):.2%}")
-        print(f"    Correlation:            {np.corrcoef(forecast_arr, market_arr)[0,1]:.3f}")
-        print(f"    Calibrated Risk Prem:   {calculate_vol_risk_premium(forecast_history, market_iv_history):.2%}")
-    
-    df_results = pd.DataFrame(results)
-    df_trades = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
-    
-    if len(df_results) == 0:
-        print("  [!] No valid backtest results")
-        return None
-    
-    print(f"  * Generated {len(df_results)} daily observations")
-    print(f"  * Completed {len(df_trades)} round-trip trades")
-    print(f"  * Regime blocker prevented {blocked_count} entries during stress periods")
-    
-    print("\n[6/6] Performance Analysis...")
-    
+        print(f"    Mean Forecast:          {diagnostics['mean_forecast']:.2%}")
+        print(f"    Mean Market IV:         {diagnostics['mean_market_iv']:.2%}")
+        print(f"    Mean Forecast Error:    {diagnostics['mean_error']:.2%}")
+        print(f"    RMSE:                   {diagnostics['rmse']:.2%}")
+        print(f"    Correlation:            {diagnostics['correlation']:.3f}")
+        print(f"    Vol Risk Premium:       {diagnostics['vol_risk_premium']:.2%}")
+
+def output_performance_analysis(df_trades):
     if len(df_trades) > 0:
         print(f"\n  Trade Statistics:")
         print(f"    Total Trades:     {len(df_trades):>6}")
@@ -819,10 +279,280 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
         print(f"    Entry Costs:        ${df_trades['entry_tc'].sum():>10,.2f}")
         print(f"    Exit Costs:         ${df_trades['exit_tc'].sum():>10,.2f}")
         print(f"    Hedge Rebal Costs:  ${df_trades['hedge_rebalance_costs'].sum():>10,.2f}")
+
+def get_trading_dates(options_data, train_window, start_date=None, end_date=None):
+    trading_dates = sorted(options_data['date'].unique())
+    
+    if start_date is not None:
+        start_date = pd.to_datetime(start_date)
+        trading_dates = [d for d in trading_dates if d >= start_date]
+        print(f"Start date filter: {start_date.date()}")
+    
+    if end_date is not None:
+        end_date = pd.to_datetime(end_date)
+        trading_dates = [d for d in trading_dates if d <= end_date]
+        print(f"End date filter: {end_date.date()}")
+    
+    print(f"{len(trading_dates)} trading dates with options data")
+    print(f"Training window: {train_window} days, will start backtesting from day {train_window + 1}")
+    
+    if len(trading_dates) <= train_window:
+        print(f"Error: Not enough data. Need >{train_window} days, have {len(trading_dates)}")
+        return None
+    
+    return trading_dates
+
+def get_regime_blocker(trading_dates, train_window, stock_data):
+    backtest_start_date = trading_dates[train_window]
+    historical_stock_data = stock_data.loc[:backtest_start_date].iloc[:-1]
+    log_returns_historical = parse_data(historical_stock_data.reset_index(), price_col='prc')
+    
+    print(f"Training regime blocker on data up to {backtest_start_date.date()} ({len(log_returns_historical)} days)")
+    
+    try:
+        regime_blocker = RegimeBlockerXGB(
+            returns=log_returns_historical,
+            stress_vol_percentile=90.0,
+            stress_drawdown_threshold=-0.05,
+            calm_vol_percentile=25.0,
+            block_threshold=0.5,
+            random_state=42,
+            verbose=False
+        )
+    except Exception as e:
+        print(f"Could not initialize regime blocker: {e}")
+        print("Continuing without regime blocking")
+        regime_blocker = None
+    
+    return regime_blocker
+
+def rolling_window_backtest(ticker, train_window=126, refit_frequency=21, 
+                            starting_capital=100000, position_size=8000,
+                            start_date=None, end_date=None,
+                            use_regime_blocker=True,
+                            use_earnings_blocker=True,
+                            earnings_csv='earnings_data.csv',
+                            earnings_before=7, 
+                            earnings_after=2, 
+                            earnings_exit=3,
+                            verbose=False):
+    
+    ticker_upper = ticker.upper()
+    ticker_lower = ticker.lower()
+    dividend_yield = get_dividend_yield(ticker_upper)
+    sp_data_path = f"data/{ticker_lower}_stock_prices_2020_2024.csv"
+    options_data_path = f"data/{ticker_lower}_options_2020_2024.csv"
+    
+    print(f"\nLoading data")
+    
+    stock_data = pd.read_csv(sp_data_path, parse_dates=['date'])
+    stock_data['date'] = pd.to_datetime(stock_data['date'])
+    stock_data = stock_data.set_index('date').sort_index()
+    
+    options_data = load_options_data(options_data_path, ticker=ticker_upper)
+    print(f"Loaded {len(stock_data)} days of {ticker_upper} stock data")
+    print(f"Loaded {len(options_data)} option quotes for {ticker_upper}")
+
+    options_by_date = dict(tuple(options_data.groupby('date', sort=False)))
+    
+    trading_dates = get_trading_dates(options_data, train_window, start_date, end_date)
+    if not trading_dates:
+        return None
+    
+    earnings_blocker = None
+    if use_earnings_blocker:
+        earnings_blocker = EarningsBlocker(
+            ticker=ticker,
+            earnings_csv=earnings_csv,
+            before_days=earnings_before,
+            after_days=earnings_after,
+            exit_days=earnings_exit,
+            verbose=verbose
+        )
+    
+    regime_blocker = None
+    if use_regime_blocker:
+        regime_blocker = get_regime_blocker(trading_dates, train_window, stock_data)
+    
+    results = []
+    trade_log = []
+    portfolio_value = starting_capital
+    active_position = None
+    tc_calc = TransactionCost()
+    iv_history = []
+    
+    print("\nStarting backtest")
+    print(f"  Starting Capital: ${starting_capital:,.2f}")
+    print(f"  Position Size: ${position_size:,.2f}")
+    volForecaster = VolForecaster(stock_data, train_window, refit_frequency, verbose)
+    
+    processed_count = 0
+    skipped_count = 0
+    blocked_count = 0
+    trades_entered = 0
+    trades_exited = 0
+    total_dates = len(trading_dates)
+
+    for i, current_date in enumerate(trading_dates):
+        # progress indicator
+        if i % 20 == 0:
+            progress_pct = (i / total_dates) * 100
+            print(f"\r  Progress: {i}/{total_dates} dates ({progress_pct:.1f}%) - Trades: {trades_entered} entered, {trades_exited} exited, Blocked: {blocked_count}", end="", flush=True)
+        
+        if i < train_window:
+            continue  # Need minimum training data
+        
+        if current_date not in stock_data.index:
+            skipped_count += 1
+            if verbose:
+                print(f"[{current_date.date()}] No stock data for this date")
+            continue
+        spot_price = stock_data.loc[current_date, 'prc']
+        
+        garch_forecast = volForecaster.get_forecast(current_date)
+        
+        if active_position is not None:
+            updated = active_position.update(current_date, spot_price, options_by_date)
+            if not updated:
+                continue
+
+            should_exit, exit_reason = active_position.check_exit(current_date, earnings_blocker)
+            trade_record = None
+            if should_exit:
+                trade_record = active_position.close(current_date, spot_price, tc_calc, ticker_upper)
+                trade_record['exit_reason'] = exit_reason
+                portfolio_value += trade_record['net_pnl']
+                trade_log.append(trade_record)
+                if verbose:
+                    print(f"\n[{current_date.date()}] EXIT: {exit_reason} | P&L: ${trade_record['net_pnl']:.2f}")
+                trades_exited += 1
+
+            results.append(build_result_row(
+                current_date, spot_price, garch_forecast, portfolio_value,
+                market_iv=trade_record['exit_iv'] if trade_record else active_position.current_iv,
+                position_status='EXITED' if trade_record else 'HOLDING',
+                days_held=trade_record['days_held'] if trade_record else active_position.days_held,
+                iv_change_pct=trade_record['iv_change_pct'] if trade_record else active_position.iv_change_pct,
+                trade_pnl_dollars=trade_record['net_pnl'] if trade_record else 0,
+                traded=should_exit,
+            ))
+            processed_count += 1
+            if should_exit:
+                active_position = None
+            continue
+        
+        strikes, maturities, market_prices = get_iv_surface_for_date(
+            options_data, current_date, spot_price, options_by_date=options_by_date
+        )
+        
+        if strikes is None:
+            skipped_count += 1
+            if verbose:
+                print(f"[{current_date.date()}] Insufficient options data, skipping...")
+            continue
+        
+        try:
+            iv_calc = ImpliedVolSurface(
+                spot_price=spot_price,
+                risk_free_rate=0.02,
+                dividend_yield=dividend_yield,
+                strikes=strikes,
+                maturities=maturities,
+                market_prices=market_prices,
+                verbose=False
+            )
+            
+            if iv_calc.iv_surface is None:
+                skipped_count += 1
+                continue
+            
+            atm_option = get_atm_option_for_dte(
+                options_data, current_date, spot_price,
+                target_dte=45, dte_range=(30, 45),
+                options_by_date=options_by_date
+            )
+            
+            if atm_option is None:
+                skipped_count += 1
+                if verbose:
+                    print(f"[{current_date.date()}] No 30-45 DTE options available")
+                continue
+            
+            market_iv = get_iv_for_option(
+                iv_calc, atm_option['strike'], atm_option['maturity'],
+                atm_option['call_price'], atm_option['put_price']
+            )
+            
+            if np.isnan(market_iv):
+                skipped_count += 1
+                continue
+            
+            iv_history.append(market_iv)
+            if len(iv_history) > 252:
+                iv_history = iv_history[-252:]
+
+            volForecaster.record_market_iv(market_iv)
+
+            signal, iv_diff, iv_percentile, is_blocked, entry_notes = should_enter(
+                market_iv, garch_forecast, iv_history, regime_blocker, earnings_blocker, current_date
+            )
+            if is_blocked:
+                blocked_count += 1
+
+            if signal == 'SELL':
+                active_position = Position.open(
+                    current_date, spot_price, atm_option, market_iv, garch_forecast,
+                    dividend_yield, ticker_upper, position_size, starting_capital,
+                    tc_calc, verbose
+                )
+                if active_position is None:
+                    signal = 'HOLD'
+                else:
+                    trades_entered += 1
+                    if verbose:
+                        print(f"\n[{current_date.date()}] ENTRY (SELL): Strike ${atm_option['strike']:.0f}, "
+                              f"DTE {atm_option['dte']}, IV {market_iv:.1%}, GARCH {garch_forecast:.1%}, "
+                              f"Credit ${active_position.entry_credit:.0f}")
+
+            results.append(build_result_row(
+                current_date, spot_price, garch_forecast, portfolio_value,
+                market_iv=market_iv,
+                iv_spread=iv_diff,
+                iv_percentile=iv_percentile if len(iv_history) >= 20 else np.nan,
+                signal=signal,
+                blocked=is_blocked,
+                entry_notes='; '.join(entry_notes) if entry_notes else '',
+                atm_strike=atm_option['strike'],
+                atm_dte=atm_option['dte'],
+                straddle_price=atm_option['straddle_price'],
+                traded=signal == 'SELL',
+            ))
+            processed_count += 1
+            
+        except Exception as e:
+            skipped_count += 1
+            if verbose:
+                print(f"[{current_date.date()}] Error: {str(e)}")
+            continue
+    
+    print(f"\n\nProcessing results")
+    print(f"  Processed: {processed_count}, Skipped: {skipped_count}, Blocked: {blocked_count}")
+    print(f"  Trades entered: {trades_entered}, Trades exited: {trades_exited}")
+    
+    output_diagnostics(volForecaster)
+    
+    df_results = pd.DataFrame(results)
+    df_trades = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
+    
+    if len(df_results) == 0:
+        print("No valid backtest results")
+        return None
+    
+    output_performance_analysis(df_trades)
     
     # Entry criteria distribution
     if 'signal' in df_results.columns:
-        print(f"\n  Signal Distribution:")
+        print(f"\nSignal Distribution:")
         for sig in ['SELL', 'HOLD']:
             count = (df_results['signal'] == sig).sum()
             pct = count / len(df_results) * 100
@@ -836,29 +566,25 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
             print(f"    Median:           {iv_spreads.median():>7.2%}")
             print(f"    % Above 2%:       {(iv_spreads > 0.02).mean()*100:>6.1f}%")
     
-    print(f"\n  Final Portfolio Value: ${portfolio_value:,.2f}")
-    print(f"  Total Return:          {(portfolio_value - starting_capital) / starting_capital * 100:.2f}%")
+    print(f"\nFinal Portfolio Value: ${portfolio_value:,.2f}")
+    print(f"Total Return:          {(portfolio_value - starting_capital) / starting_capital * 100:.2f}%")
     
     if earnings_blocker:
         earnings_blocker.print_stats()
-    
-    print("\n  Backtest complete!")
-    print("="*80)
     
     df_results.attrs['trade_log'] = df_trades
     
     return df_results
 
 
-def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.png'):
+def plot_short_vol_results(results_df, save_path='results/graphs/backtest_short_vol_analysis.png'):
     if results_df is None or len(results_df) == 0:
-        print("  [!] No results to plot")
+        print("No results to plot")
         return
 
     fig = plt.figure(figsize=(18, 14))
     gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.25)
 
-    # Prepare series
     dates = pd.to_datetime(results_df['date'])
     portfolio_values = results_df['portfolio_value'].astype(float).values
     starting_value = float(portfolio_values[0])
@@ -867,7 +593,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
 
     trade_log = results_df.attrs.get('trade_log', pd.DataFrame())
 
-    # 1) Portfolio value
+    # Portfolio value
     ax1 = fig.add_subplot(gs[0, :])
     ax1.plot(dates, portfolio_values, linewidth=2, color='#2E86AB', label='Portfolio Value')
     ax1.fill_between(dates, starting_value, portfolio_values, alpha=0.25, color='#2E86AB')
@@ -877,7 +603,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
         entry_dates = pd.to_datetime(trade_log['entry_date'])
         exit_dates = pd.to_datetime(trade_log['exit_date'])
 
-        # Mark entries/exits (limit legend spam)
+        # Mark entries/exits
         ax1.scatter(entry_dates, np.interp(mdates.date2num(entry_dates), mdates.date2num(dates), portfolio_values),
                     s=18, color='#E63946', alpha=0.75, label='Trade Entry')
         ax1.scatter(exit_dates, np.interp(mdates.date2num(exit_dates), mdates.date2num(dates), portfolio_values),
@@ -890,7 +616,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
     ax1.legend(ncols=3)
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
 
-    # 2) Drawdown
+    # Drawdown
     ax2 = fig.add_subplot(gs[1, :])
     ax2.fill_between(dates, 0, drawdown, color='#A23B72', alpha=0.7)
     ax2.plot(dates, drawdown, linewidth=1.5, color='#A23B72')
@@ -899,7 +625,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
     ax2.grid(True, alpha=0.3)
     ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
 
-    # 3) Trade P&L distribution
+    # Trade P&L distribution
     ax3 = fig.add_subplot(gs[2, 0])
     if len(trade_log) > 0 and 'net_pnl' in trade_log.columns:
         pnls = trade_log['net_pnl'].astype(float).values
@@ -914,7 +640,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
         ax3.axis('off')
         ax3.text(0.5, 0.5, 'No completed trades to plot', ha='center', va='center')
 
-    # 4) Exit reasons
+    # Exit reasons
     ax4 = fig.add_subplot(gs[2, 1])
     if len(trade_log) > 0 and 'exit_reason' in trade_log.columns:
         reason_counts = trade_log['exit_reason'].value_counts().head(8)
@@ -925,7 +651,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
     else:
         ax4.axis('off')
 
-    # 5) Forecast vs Market IV + SELL signals
+    # Forecast vs Market IV + SELL signals
     ax5 = fig.add_subplot(gs[3, 0])
     if 'forecast_iv' in results_df.columns and 'market_iv' in results_df.columns:
         forecast_iv = results_df['forecast_iv'].astype(float).values * 100
@@ -948,7 +674,7 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
     else:
         ax5.axis('off')
 
-    # 6) Metrics summary
+    # Metrics summary
     ax6 = fig.add_subplot(gs[3, 1])
     ax6.axis('off')
 
@@ -967,24 +693,24 @@ def plot_short_vol_results(results_df, save_path='backtest_short_vol_analysis.pn
     total_net_pnl = float(trade_log['net_pnl'].sum()) if total_trades > 0 and 'net_pnl' in trade_log.columns else 0.0
 
     metrics_text = f"""
-SHORT VOL PERFORMANCE SUMMARY
+        SHORT VOL PERFORMANCE SUMMARY
 
-Total Return:        {total_return*100:>7.2f}%
-Annualized Return:   {annual_return*100:>7.2f}%
-Sharpe (daily):      {sharpe:>7.3f}
-Max Drawdown:        {max_dd*100:>7.2f}%
+        Total Return:        {total_return*100:>7.2f}%
+        Annualized Return:   {annual_return*100:>7.2f}%
+        Sharpe (daily):      {sharpe:>7.3f}
+        Max Drawdown:        {max_dd*100:>7.2f}%
 
-Total Trades:        {total_trades:>7}
-Win Rate:            {win_rate:>7.1f}%
-Total Net P&L:       ${total_net_pnl:>10,.2f}
-"""
+        Total Trades:        {total_trades:>7}
+        Win Rate:            {win_rate:>7.1f}%
+        Total Net P&L:       ${total_net_pnl:>10,.2f}
+        """
 
     ax6.text(0.06, 0.5, metrics_text, fontsize=11, family='monospace',
              verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
 
     plt.suptitle('Short Vol Strategy - Performance Dashboard', fontsize=16, fontweight='bold', y=0.995)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\n  * Charts saved to {save_path}")
+    print(f"\nCharts saved to {save_path}")
     plt.close()
 
 
@@ -1009,16 +735,16 @@ if __name__ == "__main__":
         start_date=None,
         end_date=None,
         verbose=True,
-        earnings_csv=f'{ticker.lower()}_earnings_dates.csv'
+        earnings_csv=f'data/{ticker.lower()}_earnings_dates.csv'
     )
     
     if results is not None:
-        results.to_csv(f"backtest_results_{ticker.lower()}_SHORT_VOL.csv", index=False)
-        print(f"\nDaily results saved to backtest_results_{ticker.lower()}_SHORT_VOL.csv")
+        results.to_csv(f"results/res/backtest_results_{ticker.lower()}_SHORT_VOL.csv", index=False)
+        print(f"\nDaily results saved to results/res/backtest_results_{ticker.lower()}_SHORT_VOL.csv")
         
         trade_log = results.attrs.get('trade_log', pd.DataFrame())
         if len(trade_log) > 0:
-            trade_log.to_csv(f"trade_log_{ticker.lower()}_SHORT_VOL.csv", index=False)
-            print(f"Trade log saved to trade_log_{ticker.lower()}_SHORT_VOL.csv")
+            trade_log.to_csv(f"results/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv", index=False)
+            print(f"Trade log saved to results/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv")
 
-        plot_short_vol_results(results, save_path=f"backtest_short_vol_{ticker.lower()}_analysis.png")
+        plot_short_vol_results(results, save_path=f"results/graphs/backtest_short_vol_{ticker.lower()}_analysis.png")
