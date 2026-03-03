@@ -37,7 +37,9 @@ class RegimeBlockerXGB:
         
         self.model = None
         self.feature_names = None
-        self.regime_labels = ['Calm', 'Normal', 'Stress']
+        # Simplified to binary classification: Normal (0) vs Stress (1)
+        # This fixes the "Invalid classes" error when only 2 classes are present
+        self.regime_labels = ['Normal', 'Stress']
         self.label_params = None
         self._is_fitted = False
         
@@ -121,17 +123,16 @@ class RegimeBlockerXGB:
             'stress_drawdown_threshold': self.stress_drawdown_threshold
         }
         
+        # Binary classification: Normal (default) vs Stress
+        # Removed 'Calm' category to fix "Invalid classes" error
         stress_mask = (
             (vol_20d > stress_vol_threshold) | 
             (drawdown_20d < self.stress_drawdown_threshold)
         )
         labels[stress_mask] = 'Stress'
         
-        calm_mask = (
-            (vol_20d < calm_vol_threshold) & 
-            (drawdown_20d > -0.02)
-        )
-        labels[calm_mask & ~stress_mask] = 'Calm'
+        # No 'Calm' category - everything non-Stress is 'Normal'
+        # This ensures binary classes [0, 1] for XGBClassifier
         
         return labels
     

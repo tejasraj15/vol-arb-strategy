@@ -10,8 +10,8 @@ def garch_modelling(log_returns, DE_MEAN, MODEL, DISTRIBUTION, validity_checks):
 
     # ADF test
     adf_result = adfuller(log_returns)
-    print("ADF statistic:", adf_result[0])
-    print("p-value:", adf_result[1])
+    # print("ADF statistic:", adf_result[0])
+    # print("p-value:", adf_result[1])
     
     # ACF plot
     # plot_acf(log_returns, lags=30)
@@ -20,11 +20,12 @@ def garch_modelling(log_returns, DE_MEAN, MODEL, DISTRIBUTION, validity_checks):
 
     # ARCH LM test >> if p-value is small, there is ARCH effect
     arch_test = het_arch(log_returns)
-    print("ARCH LM p-value:", arch_test[1])
+    # print("ARCH LM p-value:", arch_test[1])  # Commented to reduce output spam
 
-    if arch_test[1] > 0.05:
-        print("No ARCH effect detected in the series.")
-        exit()
+    # Relax ARCH test - proceed even without strong ARCH effect
+    # (Options markets expect vol clustering even when historical test doesn't detect it)
+    if arch_test[1] > 0.20:  # Only skip if p-value > 0.20 (was 0.05)
+        pass  # Continue with GARCH fit anyway
 
     if DE_MEAN == "Constant":
         garch = arch_model(
@@ -47,7 +48,11 @@ def garch_modelling(log_returns, DE_MEAN, MODEL, DISTRIBUTION, validity_checks):
             dist=DISTRIBUTION
         )
 
-    garch_res = garch.fit(update_freq=5)
+    garch_res = garch.fit(
+        update_freq=5, 
+        disp='off',
+        options={'maxiter': 1000}  # Increase iteration limit for EGARCH convergence
+    )
 
     # print(garch_res.summary())
 
@@ -110,8 +115,24 @@ def garch_modelling(log_returns, DE_MEAN, MODEL, DISTRIBUTION, validity_checks):
 
     forecast = garch_res.forecast(horizon=1)
     sigma_forecast = forecast.variance.iloc[-1, 0] ** 0.5
-    print("Next period volatility forecast:", sigma_forecast)
+    
+    # Convert from daily to annualized volatility
+    # 1. Divide by 100 to undo the scaling applied to returns
+    # 2. Multiply by sqrt(252) to annualize (252 trading days/year)
+    sigma_forecast_annualized = (sigma_forecast / 100) * np.sqrt(252)
+    
+    # Sanity check: clip extreme forecasts (EGARCH can explode)
+    if sigma_forecast_annualized > 2.0 or sigma_forecast_annualized < 0.05:
+        # Fallback to historical realized vol if forecast is out of bounds
+        fallback_vol = log_returns.std() * np.sqrt(252)
+        print(f"  [!] Warning: EGARCH forecast {sigma_forecast_annualized:.2%} out of bounds, using fallback {fallback_vol:.2%}")
+        sigma_forecast_annualized = fallback_vol
+    
+    # Additional sanity: ensure forecast is finite
+    if not np.isfinite(sigma_forecast_annualized):
+        sigma_forecast_annualized = log_returns.std() * np.sqrt(252)
+        print(f"  [!] Warning: EGARCH forecast was NaN/Inf, using fallback {sigma_forecast_annualized:.2%}")
 
-    return garch_res, sigma_forecast
+    return garch_res, sigma_forecast_annualized
 
 

@@ -1,3 +1,5 @@
+'''
+
 import yfinance as yf
 import numpy as np
 import scipy.stats as si
@@ -50,3 +52,5 @@ def implied_volatility_put(self, market_price):
     return brentq(objective, 0.01, 5.0)
 
 bsm = BlackScholesModel(S=100, K=100, T=1, r=0.05, sigma=0.2)
+
+'''
