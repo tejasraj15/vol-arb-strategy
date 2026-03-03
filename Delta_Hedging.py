@@ -44,27 +44,57 @@ class DeltaHedger:
         straddle_delta = call_delta + put_delta
         return straddle_delta
     
-    def calculate_hedge_position(self, S, K, T, sigma):
-        straddle_delta = self.calculate_straddle_delta(S, K, T, self.risk_free_rate, sigma, self.dividend_yield)
-        
-        # To neutralize delta, we need to short straddle_delta shares
-        # If straddle_delta is positive, we short (sell) that many shares
-        # If straddle_delta is negative, we long (buy) that many shares
-        hedge_units = -straddle_delta
-        hedge_direction = 'LONG' if hedge_units > 0 else 'SHORT'
-        hedge_cost = abs(hedge_units) * S
-        
-        # Verify delta neutrality
-        residual_delta = straddle_delta + (-hedge_units)
-        is_delta_neutral = abs(residual_delta) < 0.001
-        
+    def calculate_hedge_position(
+        self,
+        S,
+        K,
+        T,
+        sigma,
+        position_sign: int = 1,
+        num_straddles: int = 1,
+        contract_multiplier: int = 100,
+        round_shares: bool = False,
+    ):
+        if num_straddles <= 0 or contract_multiplier <= 0:
+            raise ValueError("num_straddles and contract_multiplier must be positive")
+        if position_sign not in (-1, 1):
+            raise ValueError("position_sign must be +1 (long) or -1 (short)")
+
+        straddle_delta = self.calculate_straddle_delta(
+            S, K, T, self.risk_free_rate, sigma, self.dividend_yield
+        )
+
+        option_delta_shares = position_sign * straddle_delta * contract_multiplier * num_straddles
+
+        hedge_shares = -option_delta_shares
+        if round_shares:
+            hedge_shares = float(int(round(hedge_shares)))
+
+        if hedge_shares > 0:
+            hedge_direction = 'LONG'
+        elif hedge_shares < 0:
+            hedge_direction = 'SHORT'
+        else:
+            hedge_direction = 'FLAT'
+
+        hedge_notional = hedge_shares * S
+
+        residual_delta_shares = option_delta_shares + hedge_shares
+        is_delta_neutral = abs(residual_delta_shares) < 1e-6
+
         return {
             'straddle_delta': straddle_delta,
-            'hedge_units': hedge_units,
+            'position_sign': position_sign,
+            'num_straddles': num_straddles,
+            'contract_multiplier': contract_multiplier,
+            'option_delta_shares': option_delta_shares,
+            # Backward-compatible key; interpret as shares
+            'hedge_units': hedge_shares,
+            'hedge_shares': hedge_shares,
             'hedge_direction': hedge_direction,
-            'hedge_cost': hedge_cost if hedge_direction == 'LONG' else -hedge_cost,
-            'residual_delta': residual_delta,
-            'is_delta_neutral': is_delta_neutral
+            'hedge_cost': hedge_notional,
+            'residual_delta': residual_delta_shares,
+            'is_delta_neutral': is_delta_neutral,
         }
     
     def needs_rehedge(self, old_delta, new_delta, rehedge_threshold=0.10):
@@ -72,7 +102,6 @@ class DeltaHedger:
         return delta_change >= rehedge_threshold
     
     def analyze_rehedge_points(self, K, T, sigma, spot_range=0.10):
-        # Generate spot prices from -spot_range% to +spot_range%
         spot_moves = np.linspace(-spot_range, spot_range, 21)
         spots = self.spot_price * (1 + spot_moves)
         
@@ -83,8 +112,7 @@ class DeltaHedger:
             current_delta = self.calculate_straddle_delta(spot, K, T, self.risk_free_rate, sigma, self.dividend_yield)
             delta_change = abs(current_delta - initial_delta)
             needs_rehedge = delta_change >= 0.10
-            
-            # New hedge position at this spot
+
             new_hedge = self.calculate_hedge_position(spot, K, T, sigma)
             
             rehedge_data.append({
@@ -106,20 +134,17 @@ class DeltaHedger:
         return gamma_pnl
     
     def calculate_vega_pnl(self, K, T, current_iv, forecast_iv):
-        # Current straddle value
         call_curr = self.black_scholes_call(self.spot_price, K, T, self.risk_free_rate, current_iv, self.dividend_yield)
         put_curr = self.black_scholes_put(self.spot_price, K, T, self.risk_free_rate, current_iv, self.dividend_yield)
         straddle_curr = call_curr + put_curr
-        
-        # Value if IV moves to forecast
+
         call_forecast = self.black_scholes_call(self.spot_price, K, T, self.risk_free_rate, forecast_iv, self.dividend_yield)
         put_forecast = self.black_scholes_put(self.spot_price, K, T, self.risk_free_rate, forecast_iv, self.dividend_yield)
         straddle_forecast = call_forecast + put_forecast
-        
+
         vega_pnl = straddle_forecast - straddle_curr
         vega_pnl_pct = (vega_pnl / straddle_curr * 100) if straddle_curr != 0 else 0
-        
-        # Calculate actual vega (sensitivity per 1% IV change)
+
         d1 = (np.log(self.spot_price / K) + (self.risk_free_rate - self.dividend_yield + 0.5 * current_iv**2) * T) / (current_iv * np.sqrt(T))
         vega = self.spot_price * np.exp(-self.dividend_yield * T) * norm.pdf(d1) * np.sqrt(T) / 100
         
@@ -133,16 +158,13 @@ class DeltaHedger:
         }
     
     def calculate_theta_pnl(self, K, T, sigma, days=1):
-        # Theta is typically calculated per day and is negative for long options
         d1 = (np.log(self.spot_price / K) + (self.risk_free_rate - self.dividend_yield + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
-        
-        # Call theta
+
         call_theta = (-self.spot_price * np.exp(-self.dividend_yield * T) * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) 
                       + self.dividend_yield * self.spot_price * np.exp(-self.dividend_yield * T) * norm.cdf(d1)
                       - self.risk_free_rate * K * np.exp(-self.risk_free_rate * T) * norm.cdf(d2))
-        
-        # Put theta
+
         put_theta = (-self.spot_price * np.exp(-self.dividend_yield * T) * norm.pdf(d1) * sigma / (2 * np.sqrt(T))
                      - self.dividend_yield * self.spot_price * np.exp(-self.dividend_yield * T) * norm.cdf(-d1)
                      + self.risk_free_rate * K * np.exp(-self.risk_free_rate * T) * norm.cdf(-d2))
@@ -152,7 +174,7 @@ class DeltaHedger:
     
     def simulate_hedge_pnl(self, K, T, current_iv, forecast_iv, spot_moves=None):
         if spot_moves is None:
-            spot_moves = np.linspace(-0.10, 0.10, 21)  # -10% to +10%
+            spot_moves = np.linspace(-0.10, 0.10, 21)
         
         vega_analysis = self.calculate_vega_pnl(K, T, current_iv, forecast_iv)
         vega_pnl = vega_analysis['vega_pnl']
@@ -180,8 +202,7 @@ class DeltaHedger:
         df = self.analyze_rehedge_points(K, T, sigma, spot_range)
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-        
-        # Delta and delta change
+
         ax1.plot(df['spot_price'], df['delta'], 'b-', linewidth=2, label='Straddle Delta')
         ax1.axhline(y=0, color='black', linestyle='--', alpha=0.3)
         ax1.fill_between(df['spot_price'], -0.10, 0.10, alpha=0.2, color='green', label='No Rehedge Zone (±0.10)')
@@ -189,8 +210,7 @@ class DeltaHedger:
         ax1.set_title('Straddle Delta vs Spot Price', fontsize=12, fontweight='bold')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        
-        # Rehedge triggers
+
         rehedge_mask = df['needs_rehedge']
         ax2.scatter(df[rehedge_mask]['spot_price'], df[rehedge_mask]['delta_change'], 
                    color='red', s=100, label='Rehedge Required', zorder=5)
@@ -210,8 +230,7 @@ class DeltaHedger:
         df = self.simulate_hedge_pnl(K, T, current_iv, forecast_iv)
         
         fig, ax = plt.subplots(figsize=(12, 6))
-        
-        # Stacked area chart
+
         ax.fill_between(df['spot_move_pct'], 0, df['gamma_pnl'], alpha=0.6, label='Gamma P&L')
         ax.fill_between(df['spot_move_pct'], df['gamma_pnl'], 
                        df['gamma_pnl'] + df['vega_pnl'], alpha=0.6, label='Vega P&L')
@@ -246,9 +265,9 @@ class DeltaHedger:
         print(f"\nDelta Analysis:")
         print(f"  Straddle Delta:          {hedge['straddle_delta']:+.6f}")
         print(f"  Hedge Direction:         {hedge['hedge_direction']}")
-        print(f"  Hedge Units (shares):    {abs(hedge['hedge_units']):.6f}")
-        print(f"  Hedge Cost:              ${abs(hedge['hedge_cost']):.2f}")
-        print(f"  Residual Delta:          {hedge['residual_delta']:+.6f}")
+        print(f"  Hedge Shares:            {abs(hedge['hedge_shares']):.6f}")
+        print(f"  Hedge Notional:          ${abs(hedge['hedge_cost']):.2f}")
+        print(f"  Residual Delta (shares): {hedge['residual_delta']:+.6f}")
         print(f"  Delta Neutral:           {'✓ YES' if hedge['is_delta_neutral'] else '✗ NO'}")
         
         if forecast_iv:
