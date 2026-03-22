@@ -58,6 +58,7 @@ TRAIN_CFG = {
     'patience': 40,
 }
 
+STEPS = 5
 
 # ==============================================================
 # TRAIN
@@ -126,7 +127,7 @@ def test_stock(sym, model, stock_data):
     model.eval()
 
     temp_gen = DS3MSignalGenerator(model, DEVICE, config={
-        'n_mc_samples': 50, 'forecast_steps': 1,
+        'n_mc_samples': 10, 'forecast_steps': 1,
         'min_iv_spread': 0, 'min_iv_percentile': 0,
         'min_regime_confidence': 0, 'min_regime_stability': 0,
         'base_position_size': 0.12, 'max_position_size': 0.15,
@@ -154,7 +155,7 @@ def test_stock(sym, model, stock_data):
 
         actual_abs_ret = d['y_raw'][bar_idx]
 
-        forecast = model.forecast(x_tensor, y_tensor, steps=1, n_samples=50)
+        forecast = model.forecast(x_tensor, y_tensor, steps=STEPS, n_samples=50)
 
         fc_norm = float(forecast['vol_forecast_mean'][0, 0, 0])
         fc_std_norm = float(forecast['vol_forecast_std'][0, 0, 0])
