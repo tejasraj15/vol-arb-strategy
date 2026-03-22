@@ -75,6 +75,14 @@ def train_stock(sym, stock_data):
     to_t = lambda a: torch.FloatTensor(a).to(DEVICE)
     train_x, train_y = to_t(d['train_x']), to_t(d['train_y'])
 
+    # last 15% of training sequences for validation
+    n = train_x.shape[1]
+    split = int(n * 0.85)
+    val_x = train_x[:, split:, :]
+    val_y = train_y[:, split:, :]
+    train_x = train_x[:, :split, :]
+    train_y = train_y[:, :split, :]
+
     model = DS3M(
         x_dim=HPARAMS['x_dim'], y_dim=HPARAMS['y_dim'],
         h_dim=HPARAMS['h_dim'], z_dim=HPARAMS['z_dim'],
@@ -88,9 +96,8 @@ def train_stock(sym, stock_data):
     os.makedirs(MODEL_DIR, exist_ok=True)
     save_path = os.path.join(MODEL_DIR, f'ds3m_{sym}.pt')
 
-    # No validation — train_ds3m uses train loss for early stopping
     history = train_ds3m(
-        model, train_x, train_y, train_x, train_y,  # val = train (early stop on train)
+        model, train_x, train_y, val_x, val_y,
         save_path=save_path, **TRAIN_CFG,
     )
 
