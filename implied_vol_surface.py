@@ -38,19 +38,50 @@ class ImpliedVolSurface:
         vega_value = S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
         return vega_value
     
-    def implied_volatility(self, market_price, K, T, option_type='call', initial_guess=0.2):
-        if option_type == 'call':
-            objective = lambda sigma: self.black_scholes_call(
-                self.spot_price, K, T, self.risk_free_rate, sigma, self.dividend_yield
-            ) - market_price
-        else:
-            objective = lambda sigma: self.black_scholes_put(
-                self.spot_price, K, T, self.risk_free_rate, sigma, self.dividend_yield
-            ) - market_price
+    # def implied_volatility(self, market_price, K, T, option_type='call'):
+    #     # if option_type == 'call':
+    #     #     objective = lambda sigma: self.black_scholes_call(
+    #     #         self.spot_price, K, T, self.risk_free_rate, sigma, self.dividend_yield
+    #     #     ) - market_price
+    #     # else:
+    #     #     objective = lambda sigma: self.black_scholes_put(
+    #     #         self.spot_price, K, T, self.risk_free_rate, sigma, self.dividend_yield
+    #     #     ) - market_price
+    #     objective = lambda sigma: self.american_option_binomial(
+    #         self.spot_price, K, T, self.risk_free_rate, sigma, self.dividend_yield, option_type
+    #     ) - market_price
         
+    #     try:
+    #         iv = brentq(objective, 0.001, 5.0)
+    #         return iv
+    #     except ValueError:
+    #         return np.nan
+    
+    def implied_volatility(self, market_price, K, T, option_type='call'):
+
+        # European IV
+        european_iv = self.european_implied_vol(market_price, K, T, option_type)
+
+        if np.isnan(european_iv):
+            return np.nan
+
+        # narrow bracket around European price
+        low = max(0.001, european_iv * 0.7)
+        high = european_iv * 1.3
+
+        def objective(sigma):
+            return self.american_option_binomial(
+                self.spot_price,
+                K,
+                T,
+                self.risk_free_rate,
+                sigma,
+                self.dividend_yield,
+                option_type
+            ) - market_price
+
         try:
-            iv = brentq(objective, 0.001, 5.0)
-            return iv
+            return brentq(objective, low, high)
         except ValueError:
             return np.nan
     
@@ -211,3 +242,82 @@ class ImpliedVolSurface:
             'iv_difference': forecast_iv - current_iv,
             'iv_difference_pct': ((forecast_iv - current_iv) / current_iv * 100) if current_iv != 0 else 0
         }
+
+
+    def european_implied_vol(self, market_price, K, T, option_type='call'):
+
+        if option_type == 'call':
+            objective = lambda sigma: self.black_scholes_call(
+                self.spot_price, K, T,
+                self.risk_free_rate, sigma,
+                self.dividend_yield
+            ) - market_price
+        else:
+            objective = lambda sigma: self.black_scholes_put(
+                self.spot_price, K, T,
+                self.risk_free_rate, sigma,
+                self.dividend_yield
+            ) - market_price
+
+        try:
+            return brentq(objective, 0.001, 5.0)
+        except ValueError:
+            return np.nan
+
+    def american_option_binomial(self, S, K, T, r, sigma, q=0.0, option_type="call"):
+        """
+        Prices an American option using a CRR binomial tree 
+        S : Spot price
+        K : Strike price
+        T : Time to maturity (years)
+        r : Risk-free rate
+        sigma : Volatility
+        q : Dividend yield
+        option_type : call' or 'put'
+        steps : Number of binomial steps
+        """
+
+        steps = int(max(200, T * 365))
+        dt = T / steps
+
+        # CRR parameters
+        u = np.exp(sigma * np.sqrt(dt))
+        d = 1 / u
+        disc = np.exp(-r * dt)
+
+        p = (np.exp((r - q) * dt) - d) / (u - d)
+
+        # terminal stock prices
+        j = np.arange(steps + 1)
+        stock_prices = S * (u ** j) * (d ** (steps - j))
+
+        # terminal payoff
+        if option_type == "call":
+            option_values = np.maximum(stock_prices - K, 0.0)
+        else:
+            option_values = np.maximum(K - stock_prices, 0.0)
+
+        # backward induction
+        for i in range(steps - 1, -1, -1):
+
+            stock_prices = stock_prices[:-1] / u
+
+            continuation = disc * (
+                p * option_values[1:] +
+                (1 - p) * option_values[:-1]
+            )
+
+            if option_type == "call":
+                intrinsic = np.maximum(stock_prices - K, 0.0)
+            else:
+                intrinsic = np.maximum(K - stock_prices, 0.0)
+
+            option_values = np.maximum(continuation, intrinsic)
+
+        return option_values[0]
+
+
+
+# future improvements:
+#     use implied dividend yield (can calculate from options price I think)
+#     there is a more accurate method for option prices (PDE) but it was around 30x slower than the current implementation
