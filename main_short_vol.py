@@ -15,6 +15,8 @@ from position import Position
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
+IV_WINDOW = 60
+
 def load_options_data(filepath, ticker=None):
     df = pd.read_csv(filepath)
     df['date'] = pd.to_datetime(df['date'])
@@ -165,8 +167,14 @@ def should_enter(market_iv, garch_forecast, iv_history, regime_blocker, earnings
     garch_signal = iv_diff > 0.03
 
     if len(iv_history) >= 20:
+        iv_array = np.array(iv_history)
+        recent_iv = iv_array[-IV_WINDOW:]
+        iv_mean = np.mean(recent_iv)
+        iv_std = np.std(recent_iv)
+
+        iv_zscore = (market_iv - iv_mean) / iv_std
+        iv_expensive = iv_zscore > 1.0
         iv_percentile = (np.array(iv_history) < market_iv).sum() / len(iv_history) * 100
-        iv_expensive = iv_percentile > 80
     else:
         iv_expensive = True
         iv_percentile = 50
@@ -475,7 +483,7 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
                 active_position = Position.open(
                     current_date, spot_price, atm_option, market_iv, garch_forecast,
                     dividend_yield, ticker_upper, position_size, starting_capital,
-                    tc_calc, verbose
+                     iv_percentile, tc_calc, verbose
                 )
                 if active_position is None:
                     signal = 'HOLD'
