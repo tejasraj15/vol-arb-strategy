@@ -1,4 +1,5 @@
 import numpy as np
+from collections import deque
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -73,17 +74,11 @@ def get_iv_surface_for_date(options_df, date, spot_price, risk_free_rate=0.02, d
     if len(calls) < 10:  # Recheck after filtering
         return None, None, None
     
-    strikes = sorted(calls['strike_price'].unique())
-    maturities = sorted(calls['maturity'].unique())
-    
-    # Build price matrix
-    market_prices = np.full((len(strikes), len(maturities)), np.nan)
-    
-    for i, K in enumerate(strikes):
-        for j, T in enumerate(maturities):
-            price_data = calls[(calls['strike_price'] == K) & (calls['maturity'] == T)]
-            if len(price_data) > 0:
-                market_prices[i, j] = price_data['market_price'].iloc[0]
+    # Build price matrix using pivot
+    pivot = calls.pivot_table(index='strike_price', columns='maturity', values='market_price', aggfunc='first')
+    strikes = pivot.index.to_numpy()
+    maturities = pivot.columns.to_numpy()
+    market_prices = pivot.to_numpy(dtype=float)
     
     # Filter out strikes/maturities with too much missing data
     valid_strikes_mask = ~np.isnan(market_prices).all(axis=1)
@@ -110,10 +105,10 @@ def get_atm_option_for_dte(options_df, date, spot_price, target_dte=45, dte_rang
     if len(date_options) == 0:
         return None
     
-    date_options = date_options[
-        (date_options['days_to_expiry'] >= dte_range[0]) & 
-        (date_options['days_to_expiry'] <= dte_range[1])
-    ].copy()
+    dte = date_options['days_to_expiry'].to_numpy()
+    lo = np.searchsorted(dte, dte_range[0], side='left')
+    hi = np.searchsorted(dte, dte_range[1], side='right')
+    date_options = date_options.iloc[lo:hi].copy()
     
     if len(date_options) == 0:
         return None
@@ -379,7 +374,7 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
     portfolio_value = starting_capital
     active_position = None
     tc_calc = TransactionCost()
-    iv_history = []
+    iv_history = deque(maxlen=252)
     
     print("\nStarting backtest")
     print(f"  Starting Capital: ${starting_capital:,.2f}")
@@ -394,29 +389,29 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
     total_dates = len(trading_dates)
 
     for i, current_date in enumerate(trading_dates):
-        # progress indicator
         if i % 20 == 0:
             progress_pct = (i / total_dates) * 100
             print(f"\r  Progress: {i}/{total_dates} dates ({progress_pct:.1f}%) - Trades: {trades_entered} entered, {trades_exited} exited, Blocked: {blocked_count}", end="", flush=True)
         
         if i < train_window:
             continue  # Need minimum training data
-        
+
         if current_date not in stock_data.index:
             skipped_count += 1
             if verbose:
                 print(f"[{current_date.date()}] No stock data for this date")
             continue
         spot_price = stock_data.loc[current_date, 'prc']
-        
+
         garch_forecast = volForecaster.get_forecast(current_date)
-        
+
         if active_position is not None:
             updated = active_position.update(current_date, spot_price, options_by_date)
             if not updated:
                 continue
 
             should_exit, exit_reason = active_position.check_exit(current_date, earnings_blocker)
+
             trade_record = None
             if should_exit:
                 trade_record = active_position.close(current_date, spot_price, tc_calc, ticker_upper)
@@ -441,56 +436,33 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
                 active_position = None
             continue
         
-        strikes, maturities, market_prices = get_iv_surface_for_date(
-            options_data, current_date, spot_price, options_by_date=options_by_date
-        )
-        
-        if strikes is None:
-            skipped_count += 1
-            if verbose:
-                print(f"[{current_date.date()}] Insufficient options data, skipping...")
-            continue
-        
         try:
             iv_calc = ImpliedVolSurface(
                 spot_price=spot_price,
                 risk_free_rate=0.02,
                 dividend_yield=dividend_yield,
-                strikes=strikes,
-                maturities=maturities,
-                market_prices=market_prices,
                 verbose=False
             )
-            
-            if iv_calc.iv_surface is None:
-                skipped_count += 1
-                continue
-            
             atm_option = get_atm_option_for_dte(
                 options_data, current_date, spot_price,
                 target_dte=45, dte_range=(30, 45),
                 options_by_date=options_by_date
             )
-            
             if atm_option is None:
                 skipped_count += 1
                 if verbose:
                     print(f"[{current_date.date()}] No 30-45 DTE options available")
                 continue
-            
+
             market_iv = get_iv_for_option(
                 iv_calc, atm_option['strike'], atm_option['maturity'],
                 atm_option['call_price'], atm_option['put_price']
             )
-            
             if np.isnan(market_iv):
                 skipped_count += 1
                 continue
-            
-            iv_history.append(market_iv)
-            if len(iv_history) > 252:
-                iv_history = iv_history[-252:]
 
+            iv_history.append(market_iv)
             volForecaster.record_market_iv(market_iv)
 
             signal, iv_diff, iv_percentile, is_blocked, entry_notes = should_enter(
@@ -528,7 +500,7 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
                 traded=signal == 'SELL',
             ))
             processed_count += 1
-            
+
         except Exception as e:
             skipped_count += 1
             if verbose:

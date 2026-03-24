@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
 from scipy.stats import norm
+from joblib import Parallel, delayed
 
 
 class ImpliedVolSurface:
@@ -85,24 +86,33 @@ class ImpliedVolSurface:
         except ValueError:
             return np.nan
     
+    def _compute_iv_cell(self, i, j):
+        price = self.market_prices[i, j]
+        if np.isnan(price) or price <= 0.01:
+            return i, j, np.nan
+        try:
+            iv = self.implied_volatility(price, self.strikes[i], self.maturities[j], 'call')
+            return i, j, iv
+        except (ValueError, RuntimeError):
+            return i, j, np.nan
+
     def _compute_iv_surface(self):
-        iv_surface = np.zeros((len(self.strikes), len(self.maturities)))
-        
-        for i, K in enumerate(self.strikes):
-            for j, T in enumerate(self.maturities):
-                price = self.market_prices[i, j]
-                
-                # Skip if price is invalid or too close to zero
-                if np.isnan(price) or price <= 0.01:
-                    iv_surface[i, j] = np.nan
-                    continue
-                
-                try:
-                    iv = self.implied_volatility(price, K, T, 'call')
-                    iv_surface[i, j] = iv
-                except (ValueError, RuntimeError):
-                    iv_surface[i, j] = np.nan
-        
+        iv_surface = np.full((len(self.strikes), len(self.maturities)), np.nan)
+
+        cells = [
+            (i, j)
+            for i in range(len(self.strikes))
+            for j in range(len(self.maturities))
+            if not (np.isnan(self.market_prices[i, j]) or self.market_prices[i, j] <= 0.01)
+        ]
+
+        results = Parallel(n_jobs=-1, prefer='threads')(
+            delayed(self._compute_iv_cell)(i, j) for i, j in cells
+        )
+
+        for i, j, iv in results:
+            iv_surface[i, j] = iv
+
         return iv_surface
     
     def generate_surface_data(self, strikes, maturities, market_prices, option_type='call'):

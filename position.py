@@ -233,15 +233,13 @@ class Position:
         if date_options is None:
             return None, None
 
-        strike_options = date_options[date_options['strike_price'] == self.strike]
+        mask = (date_options['strike_price'] == self.strike) & (date_options['exdate'] == self.exdate)
+        strike_options = date_options[mask]
         calls = strike_options[strike_options['cp_flag'] == 'C']
         puts = strike_options[strike_options['cp_flag'] == 'P']
 
         if calls.empty or puts.empty:
             return None, None
-
-        calls = calls.iloc[(calls['exdate'] - self.exdate).abs().argsort()[:1]]
-        puts = puts.iloc[(puts['exdate'] - self.exdate).abs().argsort()[:1]]
 
         return calls['market_price'].iloc[0], puts['market_price'].iloc[0]
 
