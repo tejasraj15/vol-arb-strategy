@@ -11,7 +11,7 @@ CONTRACT_MULTIPLIER = 100
 STOP_LOSS_MULTIPLIER = 2.0
 IV_SPIKE_THRESHOLD = 0.04
 IV_DROP_THRESHOLD = -0.03
-IV_CHECK_AFTER_DAYS = 3
+IV_CHECK_AFTER_DAYS = 0
 MANDATORY_EXIT_DTE = 14
 
 
@@ -21,7 +21,7 @@ class Position:
     def __init__(self, entry_date, strike, entry_dte, exdate, entry_iv,
                  garch_forecast, entry_credit, entry_tc, num_straddles,
                  entry_spot, initial_hedge_shares, initial_hedge_cost,
-                 straddle_gamma, dividend_yield):
+                 straddle_gamma, dividend_yield, iv_percentile):
 
         self.entry_date = entry_date
         self.strike = strike
@@ -34,6 +34,7 @@ class Position:
         self.num_straddles = num_straddles
         self.entry_spot = entry_spot
         self.dividend_yield = dividend_yield
+        self. iv_percentile = iv_percentile
 
         # Hedge state — updated daily by _rebalance_hedge()
         self._prev_spot = entry_spot
@@ -67,7 +68,7 @@ class Position:
 
     @classmethod
     def open(cls, current_date, spot_price, atm_option, market_iv, garch_forecast,
-             dividend_yield, ticker, position_size, starting_capital,
+             dividend_yield, ticker, position_size, starting_capital,  iv_percentile,
              tc_calc: TransactionCost, verbose=False) -> "Position | None":
         """Returns None if the trade should be skipped (size / risk guard)."""
         straddle_price_per_unit = atm_option['straddle_price'] * CONTRACT_MULTIPLIER
@@ -127,6 +128,7 @@ class Position:
             initial_hedge_cost=initial_hedge_cost,
             straddle_gamma=straddle_gamma,
             dividend_yield=dividend_yield,
+            iv_percentile= iv_percentile
         )
 
     def update(self, current_date, spot_price, options_by_date: dict) -> bool:
@@ -226,6 +228,7 @@ class Position:
             'net_pnl': net_pnl,
             'garch_forecast': self.garch_forecast,
             'num_straddles': self.num_straddles,
+            'iv_entry_percentile': self.iv_percentile,
         }
 
     def _find_current_option_prices(self, current_date, options_by_date) -> tuple[float | None, float | None]:

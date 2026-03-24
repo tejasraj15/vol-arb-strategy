@@ -4,16 +4,43 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 MAX_POSITIONS = 5 # number of positions you can hold at once
+MAX_PER_SECTOR = float('inf')
 MAX_POSITION_SIZE = 0.10
 MAX_DEPLOYED = 0.40
 ONE_PER_TICKER = True
 DRAWDOWN_HALT = 0.10
 
-ALL_TICKERS = ['AAPL', 'AMD', 'AMZN', 'BA', 'BAC', 'CAT', 'DIS', 'GE', 'GOOG', 'GS', 'INTC', 'MSFT', 'MU', 'NFLX', 'NKE', 'NVDA', 'PFE', 'SBUX', 'TSLA', 'UNH', 'WMT', 'XOM']
+TICKER_SECTORS = {
+    'AAPL': 'Tech',
+    'AMD': 'Tech',
+    'AMZN': 'Tech',
+    'GOOG': 'Tech',
+    'MSFT': 'Tech',
+    'NVDA': 'Tech',
+    'MU': 'Semis',
+    'INTC': 'Semis',
+    'NFLX': 'Consumer',
+    'NKE': 'Consumer',
+    'SBUX': 'Consumer',
+    'DIS': 'Consumer',
+    'TSLA': 'Auto',
+    'WMT': 'Retail',
+    'XOM': 'Energy',
+    'PFE': 'Healthcare',
+    'UNH': 'Healthcare',
+    # 'BAC': 'Financials',
+    # 'GS': 'Financials',
+    'BA': 'Industrial',
+    'CAT': 'Industrial',
+    'GE': 'Industrial',
+}
+
+ALL_TICKERS = list(TICKER_SECTORS.keys())
 INITIAL_CASH = 100_000
 
 cash = INITIAL_CASH
 available_tickers = set(ALL_TICKERS)
+remaining_sector_counts = {sector: MAX_PER_SECTOR for sector in set(TICKER_SECTORS.values())}
 open_positions = defaultdict(list) # exit_date -> list[(trade_id, pnl, ticker, principal)]
 num_open_positions = 0
 
@@ -26,7 +53,7 @@ def can_place_trade(cost, ticker):
     deployed_capital = INITIAL_CASH - cash
     potential_deployment = (deployed_capital + cost) / INITIAL_CASH
     
-    return num_open_positions < MAX_POSITIONS and ticker in available_tickers and potential_deployment < MAX_DEPLOYED
+    return num_open_positions < MAX_POSITIONS and ticker in available_tickers and remaining_sector_counts[TICKER_SECTORS[ticker]] > 0 and potential_deployment < MAX_DEPLOYED
 
 
 # open all trade logs and sort
@@ -38,8 +65,6 @@ for ticker in ALL_TICKERS:
     df = pd.concat([df, data], ignore_index=True)
 
 df = df.sort_values(by=['entry_date', 'garch_forecast'], ascending=[True, False])
-
-print(df.head())
 
 df['entry_date'] = pd.to_datetime(df['entry_date'])
 df['exit_date'] = pd.to_datetime(df['exit_date'])
@@ -61,6 +86,7 @@ for current_date in all_dates:
                 cash += (principal + pnl)
                 num_open_positions -= 1
                 available_tickers.add(ticker)
+                remaining_sector_counts[TICKER_SECTORS[ticker]] += 1
 
                 locked_principal_after = locked_principal_before - principal
                 equity_after = cash + locked_principal_after
@@ -102,6 +128,8 @@ for current_date in all_dates:
             if ONE_PER_TICKER:
                 available_tickers.remove(trade['ticker'])
 
+            remaining_sector_counts[TICKER_SECTORS[ticker]] -= 1
+
             locked_principal_after = sum(item[3] for trades in open_positions.values() for item in trades)
             equity_after = cash + locked_principal_after
             deployed_after = locked_principal_after
@@ -120,13 +148,6 @@ for current_date in all_dates:
                 'entry_equity_after': equity_after,
                 'entry_deployed_before': deployed_before,
                 'entry_deployed_after': deployed_after,
-                'exit_date_actual': pd.NaT,
-                'exit_cash_before': np.nan,
-                'exit_cash_after': np.nan,
-                'exit_equity_before': np.nan,
-                'exit_equity_after': np.nan,
-                'exit_deployed_before': np.nan,
-                'exit_deployed_after': np.nan,
             }
             
             print(f"Trade: {current_date.date()}, {trade['ticker']} | Cash: {cash:.2f}")
@@ -142,15 +163,6 @@ for current_date in all_dates:
 dates = [r[0] for r in results]
 cash_values = [r[1] for r in results]
 deployed_values = [r[2] for r in results]
-
-plt.figure(figsize=(12, 6))
-plt.plot(dates, cash_values, linewidth=2)
-plt.xlabel('Date')
-plt.ylabel('Cash')
-plt.title('Cash Over Time')
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
 
 
 res_df = pd.DataFrame(results, columns=['date', 'equity', 'deployed_capital'])
@@ -259,7 +271,7 @@ for ax in [ax1, ax2, ax3]:
 plt.suptitle(f'Strategy: {" + ".join(ALL_TICKERS)} | Initial Capital: ${INITIAL_CASH:,}', 
              fontsize=11, y=0.995, alpha=0.7)
 
-plt.show()
+fig.savefig('strategy_performance.png')
 
 
 # Save trades
