@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from matplotlib import pyplot as plt
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -192,6 +194,13 @@ class CNN_HAR_KS(nn.Module):
         x = self.fc_block(x)
         return x #produces two numbers for vol up and down, higher number is the predicted
 
+    def extract_features(self, x):
+        x = self.conv_block(x)
+        x = nn.Flatten()(x)
+        x = self.fc_block[1](x) # Linear(4096, 64)
+        x = self.fc_block[2](x) # ReLU
+        return x    # 64-dim feature vector
+
 def train_model(model, train_loader, val_loader, max_epochs, lr, min_lr, l2, patience):
     #model is the CNN_HAR_KS model we defined, train_loader is training images and labels, val_loader is validation images, rest is all technical ML stuff like iterations, learning rate etc.
     model = model.to(device) #move model to GPU if available
@@ -293,6 +302,93 @@ def evaluate(model, loader): #loader here is the test_loader to look at accuracy
     }
 
 
+def build_har_features(components, valid_slice):
+    # valid_slice selects the same rows used for images/labels after the 21-day burn-in drop
+    rv = components["RV"].values
+    # RV_d (lag-1), RV_w (5-day mean), RV_m (22-day mean)
+    rv_d  = rv
+    rv_w  = pd.Series(rv).rolling(5,  min_periods=1).mean().values
+    rv_m  = pd.Series(rv).rolling(22, min_periods=1).mean().values
+    har = np.column_stack([rv_d, rv_w, rv_m])
+    return har[valid_slice]
+
+
+def extract_cnn_features(model, loader):
+    model.eval()
+    all_features = []
+    with torch.no_grad():
+        for X_batch, _ in loader:
+            X_batch = X_batch.to(device)
+            features = model.extract_features(X_batch)
+            all_features.append(features.cpu().numpy())
+    return np.vstack(all_features)
+
+
+def train_rv_regressor(model, train_loader, val_loader,
+                       har_train, har_val,
+                       rv_train, rv_val):
+    cnn_train = extract_cnn_features(model, train_loader)
+    cnn_val   = extract_cnn_features(model, val_loader)
+
+    X_train = np.hstack([cnn_train, har_train])
+    X_val   = np.hstack([cnn_val,   har_val])
+
+    # log transform RV targets (fit scaler on train only)
+    log_rv_train = np.log(rv_train + 1e-10)
+    log_rv_val   = np.log(rv_val   + 1e-10)
+    rv_scaler = StandardScaler()
+    y_train_scaled = rv_scaler.fit_transform(log_rv_train.reshape(-1, 1)).ravel()
+    y_val_scaled   = rv_scaler.transform(log_rv_val.reshape(-1, 1)).ravel()
+
+    # also scale features (fit on train only)
+    feat_scaler = StandardScaler()
+    X_train_scaled = feat_scaler.fit_transform(X_train)
+    X_val_scaled   = feat_scaler.transform(X_val)
+
+    regressor = Ridge(alpha=1.0)
+    regressor.fit(np.vstack([X_train_scaled, X_val_scaled]),
+                  np.concatenate([y_train_scaled, y_val_scaled]))
+    return regressor, rv_scaler, feat_scaler
+
+
+def forecast_rv(model, regressor, rv_scaler, feat_scaler, loader, har_test):
+    cnn_feats = extract_cnn_features(model, loader)
+    X = feat_scaler.transform(np.hstack([cnn_feats, har_test]))
+    log_rv_pred_scaled = regressor.predict(X)
+    log_rv_pred = rv_scaler.inverse_transform(log_rv_pred_scaled.reshape(-1, 1)).ravel()
+    return np.exp(log_rv_pred)
+
+
+def evaluate_rv_forecast(rv_true, rv_pred):
+    mae  = mean_absolute_error(rv_true, rv_pred)
+    rmse = np.sqrt(mean_squared_error(rv_true, rv_pred))
+    corr = np.corrcoef(rv_true, rv_pred)[0, 1]
+    return {"mae": mae, "rmse": rmse, "corr": corr}
+
+
+def plot_rv_forecast(rv_true, rv_pred):
+    _, axes = plt.subplots(2, 1, figsize=(14, 7))
+
+    axes[0].plot(rv_true,  label="Actual RV",   alpha=0.8)
+    axes[0].plot(rv_pred,  label="Forecast RV", alpha=0.8)
+    axes[0].set_title("RV Forecast vs Actual (Test Set)")
+    axes[0].set_xlabel("Day")
+    axes[0].set_ylabel("Realised Variance")
+    axes[0].legend()
+
+    signal = rv_pred - rv_true
+    axes[1].bar(range(len(signal)), signal, color=["red" if s > 0 else "green" for s in signal], alpha=0.6)
+    axes[1].axhline(0, color="black", linewidth=0.8)
+    axes[1].set_title("Forecast Error (RV_forecast - RV_actual)")
+    axes[1].set_xlabel("Day")
+    axes[1].set_ylabel("Error")
+
+    plt.tight_layout()
+    plt.savefig("rv_forecast.png", dpi=150)
+    plt.show()
+    print("Saved: rv_forecast.png")
+
+
 #Plotting graphs: note that if val loss rises and train loss falls, then there is overfitting
 def plot_training_history(history: dict):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -343,6 +439,11 @@ def main():
     drop = 21
     valid_components = components.iloc[21:-1].reset_index(drop=True) #we drop the first 21 days as they have many NaN values due to rolling windows and we drop the last day as it has no label
     labels_valid = labels[21:-1]
+    # tomorrow's RV for each sample (regression target)
+    rv_series = components["RV"].values
+    rv_next = rv_series[22:]  # shift by 1: rv_next[i] = RV of day i+1
+    # HAR features aligned to the same valid samples
+    har_features = build_har_features(components, slice(21, -1))
     images = build_images(valid_components)
     print("Images shape{} and now {} samples of 16x16 greyscale".format(images.shape, images.shape[0]))
     print("Splitting into train and test sets")
@@ -355,12 +456,21 @@ def main():
     y_train = labels_valid[:n_train]
     y_test = labels_valid[n_train:]
 
+    rv_train_full  = rv_next[:n_train]
+    rv_test        = rv_next[n_train:]
+    har_train_full = har_features[:n_train]
+    har_test       = har_features[n_train:]
+
     x_train_scaled, x_test_scaled =normalise_images(x_train_raw, x_test_raw)
     x_train =x_train_scaled[:n_train_]
     x_val = x_train_scaled[n_train_:]
     y_train_ = y_train[:n_train_]
     y_val = y_train[n_train_:]
     y_train = y_train_
+    rv_train   = rv_train_full[:n_train_]
+    rv_val     = rv_train_full[n_train_:]
+    har_train  = har_train_full[:n_train_]
+    har_val    = har_train_full[n_train_:]
 
     print("Train : {}, Val: {}, Test: {}".format(len(y_train), len(y_val), len(y_test)))
     plot_sample_images(x_train, y_train, n=4)
@@ -390,7 +500,15 @@ def main():
 
     torch.save(model.state_dict(), "cnn_har_ks_weights.pth")
     print("Saved model weights to cnn_har_ks_weights.pth")
-    return model, metrics
+
+    print("Training RV regressor on CNN features")
+    regressor, rv_scaler, feat_scaler = train_rv_regressor(model, train_loader, val_loader, har_train, har_val, rv_train, rv_val)
+    rv_pred = forecast_rv(model, regressor, rv_scaler, feat_scaler, test_loader, har_test)
+    rv_metrics = evaluate_rv_forecast(rv_test, rv_pred)
+    print(f"  RV Forecast\nMAE: {rv_metrics['mae']:.6f}\nRMSE: {rv_metrics['rmse']:.6f}\nCorr: {rv_metrics['corr']:.4f}")
+    plot_rv_forecast(rv_test, rv_pred)
+
+    return model, metrics, regressor, rv_pred
 
 if __name__ == "__main__":
     main()
