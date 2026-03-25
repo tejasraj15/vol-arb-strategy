@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from collections import deque
 import pandas as pd
@@ -10,12 +11,14 @@ from dividend_yield import get_dividend_yield
 from transactionCosts import TransactionCost
 from regime_identifier import RegimeBlockerXGB
 from earnings_blocker import EarningsBlocker
-from volForecaster import VolForecaster
+from volForecaster import VolForecaster, Model
 from position import Position
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 IV_WINDOW = 60
+MODEL = Model.HARCNN
+RESULTS_DIR = f"{MODEL.name}_results"
 
 def load_options_data(filepath, ticker=None):
     df = pd.read_csv(filepath)
@@ -387,7 +390,7 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
     print("\nStarting backtest")
     print(f"  Starting Capital: ${starting_capital:,.2f}")
     print(f"  Position Size: ${position_size:,.2f}")
-    volForecaster = VolForecaster(stock_data, train_window, refit_frequency, verbose)
+    volForecaster = VolForecaster(stock_data, ticker=ticker, model=MODEL, verbose=verbose)
     
     processed_count = 0
     skipped_count = 0
@@ -557,7 +560,10 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
     return df_results
 
 
-def plot_short_vol_results(results_df, save_path='results/graphs/backtest_short_vol_analysis.png'):
+def plot_short_vol_results(results_df, save_path=None):
+    if save_path is None:
+        save_path = f"{RESULTS_DIR}/graphs/backtest_short_vol_analysis.png"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     if results_df is None or len(results_df) == 0:
         print("No results to plot")
         return
@@ -637,7 +643,7 @@ def plot_short_vol_results(results_df, save_path='results/graphs/backtest_short_
         forecast_iv = results_df['forecast_iv'].astype(float).values * 100
         market_iv = results_df['market_iv'].astype(float).ffill().values * 100
 
-        ax5.plot(dates, forecast_iv, label='Forecast (EGARCH + RP)', linewidth=2, color='#2E86AB', alpha=0.85)
+        ax5.plot(dates, forecast_iv, label=f'Forecast ({MODEL})', linewidth=2, color='#2E86AB', alpha=0.85)
         ax5.plot(dates, market_iv, label='Market IV', linewidth=2, color='#F18F01', alpha=0.85)
 
         if 'signal' in results_df.columns:
@@ -719,12 +725,14 @@ if __name__ == "__main__":
     )
     
     if results is not None:
-        results.to_csv(f"results/res/backtest_results_{ticker.lower()}_SHORT_VOL.csv", index=False)
-        print(f"\nDaily results saved to results/res/backtest_results_{ticker.lower()}_SHORT_VOL.csv")
-        
+        os.makedirs(f"{RESULTS_DIR}/res", exist_ok=True)
+        results.to_csv(f"{RESULTS_DIR}/res/backtest_results_{ticker.lower()}_SHORT_VOL.csv", index=False)
+        print(f"\nDaily results saved to {RESULTS_DIR}/res/backtest_results_{ticker.lower()}_SHORT_VOL.csv")
+
         trade_log = results.attrs.get('trade_log', pd.DataFrame())
         if len(trade_log) > 0:
-            trade_log.to_csv(f"results/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv", index=False)
-            print(f"Trade log saved to results/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv")
+            os.makedirs(f"{RESULTS_DIR}/trade_log", exist_ok=True)
+            trade_log.to_csv(f"{RESULTS_DIR}/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv", index=False)
+            print(f"Trade log saved to {RESULTS_DIR}/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv")
 
-        plot_short_vol_results(results, save_path=f"results/graphs/backtest_short_vol_{ticker.lower()}_analysis.png")
+        plot_short_vol_results(results, save_path=f"{RESULTS_DIR}/graphs/backtest_short_vol_{ticker.lower()}_analysis.png")

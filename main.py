@@ -1,7 +1,12 @@
 from collections import defaultdict
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from volForecaster import Model
+
+MODEL = Model.EGARCH
+RESULTS_DIR = f"{MODEL.name}_results"
 
 MAX_POSITIONS = 5 # number of positions you can hold at once
 MAX_PER_SECTOR = float('inf')
@@ -59,7 +64,7 @@ def can_place_trade(cost, ticker):
 # open all trade logs and sort
 df = pd.DataFrame()
 for ticker in ALL_TICKERS:
-    data = pd.read_csv(f'results/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv')
+    data = pd.read_csv(f'{RESULTS_DIR}/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv')
     data = data[['entry_date','exit_date','entry_credit','net_pnl','garch_forecast']]
     data['ticker'] = ticker
     df = pd.concat([df, data], ignore_index=True)
@@ -271,12 +276,14 @@ for ax in [ax1, ax2, ax3]:
 plt.suptitle(f'Strategy: {" + ".join(ALL_TICKERS)} | Initial Capital: ${INITIAL_CASH:,}', 
              fontsize=11, y=0.995, alpha=0.7)
 
-fig.savefig('strategy_performance.png')
+os.makedirs(f"{RESULTS_DIR}/portfolio", exist_ok=True)
+
+fig.savefig(f"{RESULTS_DIR}/portfolio/strategy_performance.png")
 
 
 # Save trades
 full_trade_log_df = pd.DataFrame(trade_records.values())
 if not full_trade_log_df.empty:
     full_trade_log_df = full_trade_log_df.sort_values(['entry_date', 'garch_forecast'], ascending=[True, False])
-full_trade_log_df.to_csv('full_trade_log.csv', index=False)
-print(f"\nSaved executed trade log: full_trade_log.csv ({len(full_trade_log_df):,} trades)")
+full_trade_log_df.to_csv(f"{RESULTS_DIR}/portfolio/full_trade_log.csv", index=False)
+print(f"\nSaved executed trade log: {RESULTS_DIR}/portfolio/full_trade_log.csv ({len(full_trade_log_df):,} trades)")
