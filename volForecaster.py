@@ -162,23 +162,52 @@ class VolForecaster:
         return True
     
     def _refit_ds3m(self, current_date: pd.Timestamp) -> bool:
-        x_dim = 1  # Number of input features
-        y_dim = 2  # Target dimension
+        # DS3M hyperparameters
+        x_dim = 1
+        y_dim = 1
         h_dim = 32
-        z_dim = 8
+        z_dim = 4
         d_dim = 2
         n_layers = 1
+        seq_len = 20
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        model_path = f"models/ds3m_{self.ticker or 'default'}.pt"
-        scaler_path = f"models/ds3m_scaler_{self.ticker or 'default'}.pkl"
+        # Dynamically select the correct data file for the ticker
+        ticker = self.ticker or 'AAPL'
+        data_path = f"data/{ticker.upper()}_stock_prices_2020_2024.csv"
+        if not os.path.exists(data_path):
+            if self.verbose:
+                print(f"Data file not found for ticker {ticker}: {data_path}")
+            return False
 
-        # Prepare your data here (X, Y) as torch tensors
-        # For now, use dummy data as a placeholder
-        # TODO: Replace with actual feature/target extraction
-        X = torch.zeros((self.train_window, 1, x_dim), dtype=torch.float32, device=torch.device)
-        Y = torch.zeros((self.train_window, 1, y_dim), dtype=torch.float32, device=device)
+        df = pd.read_csv(data_path, parse_dates=["date"])
+        df = df.sort_values("date")
+        # Compute absolute log returns for 4-hour bars
+        prices = df["prc"].astype(float)
+        log_returns = np.log(prices / prices.shift(1)).dropna()
+        abs_log_returns = np.abs(log_returns)
 
-        # Load or train DS3M model
+        # Prepare rolling windows for DS3M (seq_len=20)
+        # X: lagged |log return|, Y: |log return|
+        X_list, Y_list = [], []
+        for i in range(len(abs_log_returns) - seq_len):
+            X_list.append(abs_log_returns.iloc[i:i+seq_len].values)
+            Y_list.append(abs_log_returns.iloc[i+1:i+seq_len+1].values)
+        if not X_list or not Y_list:
+            if self.verbose:
+                print("Not enough data for DS3M input sequences.")
+            return False
+        X = torch.tensor(np.array(X_list), dtype=torch.float32, device=device).unsqueeze(-1)  # (N, seq_len, 1)
+        Y = torch.tensor(np.array(Y_list), dtype=torch.float32, device=device).unsqueeze(-1)  # (N, seq_len, 1)
+
+        # Use only the most recent window for forecasting
+        X_input = X[-1:].transpose(0, 1)  # (seq_len, 1, 1)
+        Y_input = Y[-1:].transpose(0, 1)  # (seq_len, 1, 1)
+
+        model_path = f"models/ds3m_{ticker}.pt"
+        scaler_path = f"models/ds3m_scaler_{ticker}.pkl"
+
+        # Load or initialize DS3M model
         if os.path.exists(model_path) and os.path.exists(scaler_path):
             ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
             ds3m.load_state_dict(torch.load(model_path, map_location=device))
@@ -187,12 +216,15 @@ class VolForecaster:
         else:
             ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
             # TODO: Implement actual training here
-            # For now, just save the untrained model
             torch.save(ds3m.state_dict(), model_path)
             scaler = None
             with open(scaler_path, "wb") as f:
                 pickle.dump(scaler, f)
 
+        # Forecast using DS3M
+        try:
+            out = ds3m.forecast(X_input, Y_input, steps=1, n_samples=100)
+            forecast = float(out['vol_forecast_mean'][-1][0][0])
             self._cached_forecast = forecast
             self._last_fit_date = current_date
             return True
