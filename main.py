@@ -1,11 +1,17 @@
 from collections import defaultdict
 import os
+import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from volForecaster import Model
 
-MODEL = Model.EGARCH
+if len(sys.argv) < 2:
+    print(f"Usage: python main.py <model>")
+    print(f"Available models: {[m.name for m in Model]}")
+    sys.exit(1)
+
+MODEL = Model[sys.argv[1].upper()]
 RESULTS_DIR = f"{MODEL.name}_results"
 
 MAX_POSITIONS = 5 # number of positions you can hold at once

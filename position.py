@@ -13,6 +13,7 @@ IV_SPIKE_THRESHOLD = 0.04
 IV_DROP_THRESHOLD = -0.03
 IV_CHECK_AFTER_DAYS = 0
 MANDATORY_EXIT_DTE = 14
+HEDGE_FREQ = 1  # hedge every n days
 
 
 class Position:
@@ -268,7 +269,7 @@ class Position:
 
         hedge_rebalance_cost = 0.0
         target_shares = hedge_result['hedge_shares']
-        if self.days_held % 2 == 0:  # rebalance every other day to reduce gamma bleed
+        if self.days_held % HEDGE_FREQ == 0:  # rebalance every other day to reduce gamma bleed
             shares_to_trade = target_shares - self._hedge_shares
             if abs(shares_to_trade) > 0:
                 cost_info = TransactionCostCalculator.calculate(
