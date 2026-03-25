@@ -9,10 +9,6 @@ from enum import Enum
 from harcnn_train import train_harcnn, CNN_HAR_KS
 from harcnn_ridge import forecast_next_rv, fit_ridge_for_ticker
 
-DE_MEAN = "AR"
-MODEL = "EGARCH"
-DISTRIBUTION = {"GARCH": "normal", "EGARCH": "t"}[MODEL]
-
 class Model(Enum):
     EGARCH = (126, 21)
     HARCNN = (252, 63)
@@ -118,7 +114,7 @@ class VolForecaster:
 
         try:
             _, base_forecast = garch_modelling(
-                log_returns, DE_MEAN, MODEL, DISTRIBUTION, validity_checks=False
+                log_returns, "AR", "EGARCH", "t", validity_checks=False
             )
             ensemble = self._ensemble_forecast(log_returns, base_forecast)
             risk_premium = self._vol_risk_premium()
