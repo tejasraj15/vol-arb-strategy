@@ -1,11 +1,12 @@
 import os
-import numpy as np
-import pandas as pd
+import os
 import pickle
 import torch
+import numpy as np
+import pandas as pd
 from garch import garch_modelling
 from preprocess_data import parse_data
-from enum import Enum
+from ds3m_model import DS3M
 from harcnn_train import train_harcnn, CNN_HAR_KS
 from harcnn_ridge import forecast_next_rv, fit_ridge_for_ticker
 
@@ -161,7 +162,44 @@ class VolForecaster:
         return True
     
     def _refit_ds3m(self, current_date: pd.Timestamp) -> bool:
-        return True
+        x_dim = 1  # Number of input features
+        y_dim = 2  # Target dimension
+        h_dim = 32
+        z_dim = 8
+        d_dim = 2
+        n_layers = 1
+
+        model_path = f"models/ds3m_{self.ticker or 'default'}.pt"
+        scaler_path = f"models/ds3m_scaler_{self.ticker or 'default'}.pkl"
+
+        # Prepare your data here (X, Y) as torch tensors
+        # For now, use dummy data as a placeholder
+        # TODO: Replace with actual feature/target extraction
+        X = torch.zeros((self.train_window, 1, x_dim), dtype=torch.float32, device=torch.device)
+        Y = torch.zeros((self.train_window, 1, y_dim), dtype=torch.float32, device=device)
+
+        # Load or train DS3M model
+        if os.path.exists(model_path) and os.path.exists(scaler_path):
+            ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
+            ds3m.load_state_dict(torch.load(model_path, map_location=device))
+            with open(scaler_path, "rb") as f:
+                scaler = pickle.load(f)
+        else:
+            ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
+            # TODO: Implement actual training here
+            # For now, just save the untrained model
+            torch.save(ds3m.state_dict(), model_path)
+            scaler = None
+            with open(scaler_path, "wb") as f:
+                pickle.dump(scaler, f)
+
+            self._cached_forecast = forecast
+            self._last_fit_date = current_date
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"DS3M forecast failed: {e}")
+            return False
 
     def _vol_risk_premium(self, min_samples: int = 60) -> float:
         if len(self._forecast_history) < min_samples:
