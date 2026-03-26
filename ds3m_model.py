@@ -89,7 +89,7 @@ class DS3M(nn.Module):
             self.yemit.append(nn.Sequential(
                 nn.Linear(z_dim + h_dim, y_dim), nn.ReLU(),
                 nn.Linear(y_dim, y_dim), nn.ReLU()))
-            self.yemit_mean.append(nn.Linear(y_dim, y_dim))
+            self.yemit_mean.append(nn.Sequential(nn.Linear(y_dim, y_dim), nn.Softplus()))
             self.yemit_std.append(nn.Sequential(
                 nn.Linear(y_dim, y_dim), nn.Softplus()))
 

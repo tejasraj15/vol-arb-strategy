@@ -4,6 +4,7 @@ import pickle
 import torch
 import numpy as np
 import pandas as pd
+from enum import Enum
 from garch import garch_modelling
 from preprocess_data import parse_data
 from ds3m_model import DS3M
@@ -11,12 +12,12 @@ from harcnn_train import train_harcnn, CNN_HAR_KS
 from harcnn_ridge import forecast_next_rv, fit_ridge_for_ticker
 
 class Model(Enum):
-    EGARCH = (126, 21)
-    HARCNN = (252, 63)
-    GNN = (126, 21)
-    DS3M = (126, 21)
-    
-    def __init__(self, train_window, refit_frequency):
+    EGARCH = (1, 126, 21)
+    HARCNN = (2, 252, 63)
+    GNN    = (3, 126, 21)
+    DS3M   = (4, 126, 21)
+
+    def __init__(self, _id, train_window, refit_frequency):
         self.train_window = train_window
         self.refit_frequency = refit_frequency
 
@@ -162,6 +163,7 @@ class VolForecaster:
         return True
     
     def _refit_ds3m(self, current_date: pd.Timestamp) -> bool:
+        print(f"[DS3M] Using DS3M model for forecasting on {self.ticker} at {current_date}")
         # DS3M hyperparameters
         x_dim = 1
         y_dim = 1
@@ -182,7 +184,8 @@ class VolForecaster:
 
         df = pd.read_csv(data_path, parse_dates=["date"])
         df = df.sort_values("date")
-        # Compute absolute log returns for 4-hour bars
+        # Only use data available up to current_date (no lookahead)
+        df = df[df["date"] <= current_date]
         prices = df["prc"].astype(float)
         log_returns = np.log(prices / prices.shift(1)).dropna()
         abs_log_returns = np.abs(log_returns)
@@ -224,13 +227,17 @@ class VolForecaster:
         # Forecast using DS3M
         try:
             out = ds3m.forecast(X_input, Y_input, steps=1, n_samples=100)
-            forecast = float(out['vol_forecast_mean'][-1][0][0])
-            self._cached_forecast = forecast
+            # DS3M outputs |log return| per bar; annualise to match EGARCH/HARCNN scale
+            raw_forecast = abs(float(out['vol_forecast_mean'][-1][0][0]))
+            risk_premium = self._vol_risk_premium()
+            self._cached_forecast = raw_forecast * np.sqrt(252) + risk_premium
+            print(f"  [DS3M] raw={raw_forecast:.4f}, annualised={self._cached_forecast:.1%}")
             self._last_fit_date = current_date
             return True
         except Exception as e:
-            if self.verbose:
-                print(f"DS3M forecast failed: {e}")
+            import traceback
+            print(f"DS3M forecast failed: {e}")
+            traceback.print_exc()
             return False
 
     def _vol_risk_premium(self, min_samples: int = 60) -> float:

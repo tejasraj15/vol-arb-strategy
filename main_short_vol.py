@@ -17,8 +17,9 @@ from position import Position
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 IV_WINDOW = 60
-MODEL = Model.HARCNN
+MODEL = Model.DS3M
 RESULTS_DIR = f"{MODEL.name}_results"
+BACKTEST_START_DATE = pd.Timestamp("2023-06-01")
 
 def load_options_data(filepath, ticker=None):
     df = pd.read_csv(filepath)
@@ -161,12 +162,12 @@ def get_iv_for_option(iv_calc, strike, maturity, call_price, put_price):
         return np.nan
 
 
-def should_enter(market_iv, garch_forecast, iv_history, regime_blocker, earnings_blocker, current_date):
+def should_enter(market_iv, vol_forecast, iv_history, regime_blocker, earnings_blocker, current_date):
     """
     Evaluate whether market conditions justify entering a short vol trade.
     Returns (signal, iv_diff, iv_percentile, is_blocked, entry_notes).
     """
-    iv_diff = market_iv - garch_forecast
+    iv_diff = market_iv - vol_forecast
     garch_signal = iv_diff > 0.03
 
     if len(iv_history) >= 20:
@@ -204,7 +205,7 @@ def should_enter(market_iv, garch_forecast, iv_history, regime_blocker, earnings
     return signal, iv_diff, iv_percentile, is_blocked, entry_notes
 
 
-def build_result_row(current_date, spot_price, garch_forecast, portfolio_value,
+def build_result_row(current_date, spot_price, vol_forecast, portfolio_value,
                       market_iv=np.nan, iv_spread=np.nan, iv_percentile=np.nan,
                       signal='HOLD', blocked=False, entry_notes='',
                       atm_strike=np.nan, atm_dte=np.nan, straddle_price=np.nan,
@@ -214,7 +215,7 @@ def build_result_row(current_date, spot_price, garch_forecast, portfolio_value,
     return {
         'date': current_date,
         'spot_price': spot_price,
-        'forecast_iv': garch_forecast,
+        'forecast_iv': vol_forecast,
         'market_iv': market_iv,
         'iv_spread': iv_spread,
         'iv_percentile': iv_percentile,
@@ -414,7 +415,7 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
             continue
         spot_price = stock_data.loc[current_date, 'prc']
 
-        garch_forecast = volForecaster.get_forecast(current_date)
+        vol_forecast = volForecaster.get_forecast(current_date)
 
         if active_position is not None:
             updated = active_position.update(current_date, spot_price, options_by_date)
@@ -434,7 +435,7 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
                 trades_exited += 1
 
             results.append(build_result_row(
-                current_date, spot_price, garch_forecast, portfolio_value,
+                current_date, spot_price, vol_forecast, portfolio_value,
                 market_iv=trade_record['exit_iv'] if trade_record else active_position.current_iv,
                 position_status='EXITED' if trade_record else 'HOLDING',
                 days_held=trade_record['days_held'] if trade_record else active_position.days_held,
@@ -477,14 +478,14 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
             volForecaster.record_market_iv(market_iv)
 
             signal, iv_diff, iv_percentile, is_blocked, entry_notes = should_enter(
-                market_iv, garch_forecast, iv_history, regime_blocker, earnings_blocker, current_date
+                market_iv, vol_forecast, iv_history, regime_blocker, earnings_blocker, current_date
             )
             if is_blocked:
                 blocked_count += 1
 
             if signal == 'SELL':
                 active_position = Position.open(
-                    current_date, spot_price, atm_option, market_iv, garch_forecast,
+                    current_date, spot_price, atm_option, market_iv, vol_forecast,
                     dividend_yield, ticker_upper, position_size, starting_capital,
                      iv_percentile, tc_calc, verbose
                 )
@@ -494,11 +495,11 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
                     trades_entered += 1
                     if verbose:
                         print(f"\n[{current_date.date()}] ENTRY (SELL): Strike ${atm_option['strike']:.0f}, "
-                              f"DTE {atm_option['dte']}, IV {market_iv:.1%}, GARCH {garch_forecast:.1%}, "
+                              f"DTE {atm_option['dte']}, IV {market_iv:.1%}, {MODEL} {vol_forecast:.1%}, "
                               f"Credit ${active_position.entry_credit:.0f}")
 
             results.append(build_result_row(
-                current_date, spot_price, garch_forecast, portfolio_value,
+                current_date, spot_price, vol_forecast, portfolio_value,
                 market_iv=market_iv,
                 iv_spread=iv_diff,
                 iv_percentile=iv_percentile if len(iv_history) >= 20 else np.nan,
@@ -707,7 +708,7 @@ if __name__ == "__main__":
         ticker = sys.argv[1]
     else:
         ticker = 'AAPL'
-        print(f"No ticker specified, using default: {ticker}")
+        print(f"No ticker specified, default: {ticker}")
         print(f"Usage: python main_short_vol.py <TICKER>")
         print(f"Example: python main_short_vol.py AAPL\n")
     
@@ -718,7 +719,7 @@ if __name__ == "__main__":
         starting_capital=100000,
         position_size=8000,
         use_regime_blocker=True,
-        start_date=None,
+        start_date=BACKTEST_START_DATE,
         end_date=None,
         verbose=True,
         earnings_csv=f'data/{ticker.lower()}_earnings_dates.csv'
