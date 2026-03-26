@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 IV_WINDOW = 60
 MODEL = Model.DS3M
 RESULTS_DIR = f"{MODEL.name}_results"
-BACKTEST_START_DATE = pd.Timestamp("2023-06-01")
+BACKTEST_START_DATE = pd.Timestamp("2020-01-01")
 
 def load_options_data(filepath, ticker=None):
     df = pd.read_csv(filepath)

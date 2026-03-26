@@ -176,7 +176,7 @@ class VolForecaster:
 
         # Dynamically select the correct data file for the ticker
         ticker = self.ticker or 'AAPL'
-        data_path = f"data/{ticker.upper()}_stock_prices_2020_2024.csv"
+        data_path = f"data/{ticker.upper()}_stock_prices_2010_2024.csv"
         if not os.path.exists(data_path):
             if self.verbose:
                 print(f"Data file not found for ticker {ticker}: {data_path}")
