@@ -211,24 +211,27 @@ class VolForecaster:
         scaler_path = f"models/ds3m_scaler_{ticker}.pkl"
 
         # Load or initialize DS3M model
-        if os.path.exists(model_path) and os.path.exists(scaler_path):
-            ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
+        ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
+        if os.path.exists(model_path):
             ds3m.load_state_dict(torch.load(model_path, map_location=device))
+        else:
+            if self.verbose:
+                print(f"  [DS3M] No trained model found at {model_path}, using random weights")
+        scaler = None
+        if os.path.exists(scaler_path):
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
-        else:
-            ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
-            # TODO: Implement actual training here
-            torch.save(ds3m.state_dict(), model_path)
-            scaler = None
-            with open(scaler_path, "wb") as f:
-                pickle.dump(scaler, f)
 
         # Forecast using DS3M
         try:
             out = ds3m.forecast(X_input, Y_input, steps=1, n_samples=100)
             # DS3M outputs |log return| per bar; annualise to match EGARCH/HARCNN scale
-            raw_forecast = abs(float(out['vol_forecast_mean'][-1][0][0]))
+            raw_z = float(out['vol_forecast_mean'][-1][0][0])
+            # Inverse-transform from z-score back to |log return| scale
+            if scaler is not None:
+                raw_forecast = abs(raw_z * scaler['std'] + scaler['mean'])
+            else:
+                raw_forecast = abs(raw_z)
             risk_premium = self._vol_risk_premium()
             self._cached_forecast = raw_forecast * np.sqrt(252) + risk_premium
             print(f"  [DS3M] raw={raw_forecast:.4f}, annualised={self._cached_forecast:.1%}")

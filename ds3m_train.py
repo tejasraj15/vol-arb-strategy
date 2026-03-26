@@ -64,6 +64,13 @@ def train_ds3m_for_ticker(ticker):
         print(f"Not enough data for {ticker}")
         return
 
+    # Z-score normalise using training data statistics
+    rv_mean = abs_log_returns.mean()
+    rv_std  = abs_log_returns.std()
+    scaler = {'mean': float(rv_mean), 'std': float(rv_std)}
+    X = (X - float(rv_mean)) / float(rv_std)
+    Y = (Y - float(rv_mean)) / float(rv_std)
+
     # (N, seq_len, 1)
     X_tensor = torch.tensor(X, dtype=torch.float32, device=DEVICE).unsqueeze(-1)
     Y_tensor = torch.tensor(Y, dtype=torch.float32, device=DEVICE).unsqueeze(-1)
@@ -126,6 +133,9 @@ def train_ds3m_for_ticker(ticker):
         os.replace(best_path, f"{MODEL_DIR}/ds3m_{ticker}.pt")
     else:
         torch.save(ds3m.state_dict(), f"{MODEL_DIR}/ds3m_{ticker}.pt")
+    scaler_path = f"{MODEL_DIR}/ds3m_scaler_{ticker}.pkl"
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler, f)
     print(f"Saved DS3M model for {ticker} to {MODEL_DIR}/ds3m_{ticker}.pt (best loss: {best_loss:.6f})")
 
 if __name__ == "__main__":
