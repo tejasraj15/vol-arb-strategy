@@ -1,5 +1,4 @@
 import os
-import os
 import pickle
 import torch
 import numpy as np
@@ -7,8 +6,8 @@ import pandas as pd
 from enum import Enum
 from garch import garch_modelling
 from preprocess_data import parse_data
-from ds3m_model import DS3M
 from harcnn_train import train_harcnn, CNN_HAR_KS
+from ds3m_train import train_ds3m
 from harcnn_ridge import forecast_next_rv, fit_ridge_for_ticker
 
 class Model(Enum):
@@ -48,6 +47,25 @@ class VolForecaster:
             with open("cnn_image_scaler.pkl", "rb") as f:
                 self._img_scaler = pickle.load(f)
             self._ridge_bundle = fit_ridge_for_ticker(ticker, self._cnn_model, self._img_scaler)
+
+        if self.model == Model.DS3M:
+            _device = torch.device("cpu")
+            _ticker = (ticker or 'AAPL').upper()
+            model_path = f"models/ds3m_{_ticker}.pt"
+            scaler_path = f"models/ds3m_scaler_{_ticker}.pkl"
+            self._ds3m_device = _device
+            self._ds3m_seq_len = 20
+            from ds3m_model import DS3M as _DS3M
+            self._ds3m = _DS3M(1, 1, 32, 4, 2, 1, _device).to(_device)
+            if not os.path.exists(model_path):
+                print(f"[DS3M] No trained model at {model_path}, training now...")
+                train_ds3m(_ticker)
+            self._ds3m.load_state_dict(torch.load(model_path, map_location=_device))
+            self._ds3m.eval()
+            self._ds3m_scaler = None
+            if os.path.exists(scaler_path):
+                with open(scaler_path, "rb") as f:
+                    self._ds3m_scaler = pickle.load(f)
 
         self._last_fit_date: pd.Timestamp | None = None
         self._cached_forecast: float | None = None
@@ -163,78 +181,44 @@ class VolForecaster:
         return True
     
     def _refit_ds3m(self, current_date: pd.Timestamp) -> bool:
-        print(f"[DS3M] Using DS3M model for forecasting on {self.ticker} at {current_date}")
-        # DS3M hyperparameters
-        x_dim = 1
-        y_dim = 1
-        h_dim = 32
-        z_dim = 4
-        d_dim = 2
-        n_layers = 1
-        seq_len = 20
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        seq_len = self._ds3m_seq_len
+        device = self._ds3m_device
 
-        # Dynamically select the correct data file for the ticker
-        ticker = self.ticker or 'AAPL'
-        data_path = f"data/{ticker.upper()}_stock_prices_2020_2024.csv"
-        if not os.path.exists(data_path):
-            if self.verbose:
-                print(f"Data file not found for ticker {ticker}: {data_path}")
-            return False
-
-        df = pd.read_csv(data_path, parse_dates=["date"])
-        df = df.sort_values("date")
-        # Only use data available up to current_date (no lookahead)
-        df = df[df["date"] <= current_date]
-        prices = df["prc"].astype(float)
+        # Use stock data available up to current_date (no lookahead), same as HARCNN
+        historical_data = self.stock_data.loc[:current_date].iloc[:-1]
+        prices = historical_data["prc"].astype(float)
         log_returns = np.log(prices / prices.shift(1)).dropna()
         abs_log_returns = np.abs(log_returns)
 
-        # Prepare rolling windows for DS3M (seq_len=20)
-        # X: lagged |log return|, Y: |log return|
-        X_list, Y_list = [], []
-        for i in range(len(abs_log_returns) - seq_len):
-            X_list.append(abs_log_returns.iloc[i:i+seq_len].values)
-            Y_list.append(abs_log_returns.iloc[i+1:i+seq_len+1].values)
-        if not X_list or not Y_list:
+        if len(abs_log_returns) < seq_len + 1:
             if self.verbose:
-                print("Not enough data for DS3M input sequences.")
+                print(f"[DS3M] Not enough data at {current_date} (need {seq_len + 1}, have {len(abs_log_returns)})")
             return False
-        X = torch.tensor(np.array(X_list), dtype=torch.float32, device=device).unsqueeze(-1)  # (N, seq_len, 1)
-        Y = torch.tensor(np.array(Y_list), dtype=torch.float32, device=device).unsqueeze(-1)  # (N, seq_len, 1)
 
-        # Use only the most recent window for forecasting
-        X_input = X[-1:].transpose(0, 1)  # (seq_len, 1, 1)
-        Y_input = Y[-1:].transpose(0, 1)  # (seq_len, 1, 1)
+        # Build only the most recent sequence window
+        x_vals = abs_log_returns.iloc[-(seq_len + 1):-1].values   # (seq_len,)
+        y_vals = abs_log_returns.iloc[-seq_len:].values            # (seq_len,)
 
-        model_path = f"models/ds3m_{ticker}.pt"
-        scaler_path = f"models/ds3m_scaler_{ticker}.pkl"
+        scaler = self._ds3m_scaler
+        if scaler is not None:
+            x_vals = (x_vals - scaler['mean']) / scaler['std']
+            y_vals = (y_vals - scaler['mean']) / scaler['std']
 
-        # Load or initialize DS3M model
-        ds3m = DS3M(x_dim, y_dim, h_dim, z_dim, d_dim, n_layers, device).to(device)
-        if os.path.exists(model_path):
-            ds3m.load_state_dict(torch.load(model_path, map_location=device))
-        else:
-            if self.verbose:
-                print(f"  [DS3M] No trained model found at {model_path}, using random weights")
-        scaler = None
-        if os.path.exists(scaler_path):
-            with open(scaler_path, "rb") as f:
-                scaler = pickle.load(f)
+        X_input = torch.tensor(x_vals, dtype=torch.float32, device=device).view(seq_len, 1, 1)  # (seq_len, 1, 1)
+        Y_input = torch.tensor(y_vals, dtype=torch.float32, device=device).view(seq_len, 1, 1)
 
-        # Forecast using DS3M
         try:
-            out = ds3m.forecast(X_input, Y_input, steps=1, n_samples=100)
-            # DS3M outputs |log return| per bar; annualise to match EGARCH/HARCNN scale
+            with torch.no_grad():
+                out = self._ds3m.forecast(X_input, Y_input, steps=1, n_samples=100)
             raw_z = float(out['vol_forecast_mean'][-1][0][0])
-            # Inverse-transform from z-score back to |log return| scale
             if scaler is not None:
                 raw_forecast = abs(raw_z * scaler['std'] + scaler['mean'])
             else:
                 raw_forecast = abs(raw_z)
             risk_premium = self._vol_risk_premium()
             self._cached_forecast = raw_forecast * np.sqrt(252) + risk_premium
-            print(f"  [DS3M] raw={raw_forecast:.4f}, annualised={self._cached_forecast:.1%}")
+            if self.verbose:
+                print(f"  [DS3M] {current_date.date()} raw={raw_forecast:.4f}, annualised={self._cached_forecast:.1%}")
             self._last_fit_date = current_date
             return True
         except Exception as e:

@@ -19,7 +19,6 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 IV_WINDOW = 60
 MODEL = Model.DS3M
 RESULTS_DIR = f"{MODEL.name}_results"
-BACKTEST_START_DATE = pd.Timestamp("2023-06-01")
 
 def load_options_data(filepath, ticker=None):
     df = pd.read_csv(filepath)
@@ -719,7 +718,7 @@ if __name__ == "__main__":
         starting_capital=100000,
         position_size=8000,
         use_regime_blocker=True,
-        start_date=BACKTEST_START_DATE,
+        start_date=None,
         end_date=None,
         verbose=True,
         earnings_csv=f'data/{ticker.lower()}_earnings_dates.csv'
