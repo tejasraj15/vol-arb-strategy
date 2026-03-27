@@ -346,8 +346,8 @@ def rolling_window_backtest(ticker, train_window=126, refit_frequency=21,
     ticker_upper = ticker.upper()
     ticker_lower = ticker.lower()
     dividend_yield = get_dividend_yield(ticker_upper)
-    sp_data_path = f"data/{ticker_lower}_stock_prices_2020_2024.csv"
-    options_data_path = f"data/{ticker_lower}_options_2020_2024.csv"
+    sp_data_path = f"data/{ticker_upper}_stock_prices_2010_2024.csv"
+    options_data_path = f"data/{ticker_upper}_options_2020_2024.csv"
     
     print(f"\nLoading data")
     
@@ -721,7 +721,7 @@ if __name__ == "__main__":
         start_date=None,
         end_date=None,
         verbose=True,
-        earnings_csv=f'data/{ticker.lower()}_earnings_dates.csv'
+        earnings_csv=f'data/{ticker.upper()}_earnings_dates.csv'
     )
     
     if results is not None:
